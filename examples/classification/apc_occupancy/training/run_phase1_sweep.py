@@ -14,20 +14,21 @@ label leakage prevented via masked label arrays).
 
 Three sweep groups (run independently on separate GPUs):
 
-  Group A — Context Window Deep Exploration (~58 experiments)
-    - 14 symmetric bidirectional (cap 100+1+100) + 10 backward-only
-      + 22 asymmetric past-heavy + 12 future-sensitivity analysis
+  Group A — Context Window Deep Exploration (~70 experiments)
+    - 16 symmetric bidirectional (cap 100+1+100) + 13 backward-only
+      + 22 asymmetric past-heavy + 19 future-sensitivity
+      (past=60: 7, past=120: 7, past=240: 5) = 70 configs
     - Fixed: L2, RF, M+C channels, combined token
     - Goal: Map full context window landscape, find saturation point
     - NOTE: Future context capped at MAX_CONTEXT_AFTER=100 (deployment limit)
 
-  Group B — Channel Ablation × Context (~63 experiments)
-    - 21 channel combos × 3 context sizes (61min, 121min, 201min)
+  Group B — Channel Ablation × Context (~100 experiments)
+    - 25 channel combos × 4 context sizes (21min, 61min, 121min, 201min)
     - Fixed: L2, RF, combined token
     - Goal: Check if channel importance varies with context length
 
-  Group C — Classifier × Layer at Long Contexts (~54 experiments)
-    - 3 classifiers × 6 layers × 3 contexts (121min, 201min, 341min_asym)
+  Group C — Classifier × Layer at Long Contexts (~108 experiments)
+    - 6 classifiers × 6 layers × 3 contexts (121min, 201min, 341min_asym)
     - Fixed: M+C channels, combined token
     - Goal: Find best classifier and layer at long contexts
 
@@ -89,13 +90,15 @@ ALL_LAYERS = [0, 1, 2, 3, 4, 5]
 #   Symmetric windows cap at 100+1+100 = 201 min.
 #   Past context has no upper limit (backward-only can go to 1440+).
 
-# Subgroup A1: Symmetric Bidirectional (14 configs)
+# Subgroup A1: Symmetric Bidirectional (16 configs)
 # Capped at 100+1+100 = 201 min.  Measures the value of equal past+future.
 CONTEXT_SYMMETRIC = [
     {"name": "1min (0+1+0)", "context_before": 0, "context_after": 0},
     {"name": "3min (1+1+1)", "context_before": 1, "context_after": 1},
     {"name": "5min (2+1+2)", "context_before": 2, "context_after": 2},
+    {"name": "7min (3+1+3)", "context_before": 3, "context_after": 3},
     {"name": "9min (4+1+4)", "context_before": 4, "context_after": 4},
+    {"name": "11min (5+1+5)", "context_before": 5, "context_after": 5},
     {"name": "15min (7+1+7)", "context_before": 7, "context_after": 7},
     {"name": "21min (10+1+10)", "context_before": 10, "context_after": 10},
     {"name": "31min (15+1+15)", "context_before": 15, "context_after": 15},
@@ -108,19 +111,22 @@ CONTEXT_SYMMETRIC = [
     {"name": "201min (100+1+100)", "context_before": 100, "context_after": 100},
 ]
 
-# Subgroup A2: Backward-Only (10 configs) — no future information
+# Subgroup A2: Backward-Only (13 configs) — no future information
 # Pure past context: tests whether future context adds value vs pure history.
 CONTEXT_BACKWARD = [
     {"name": "bw 6min (5+1+0)", "context_before": 5, "context_after": 0},
     {"name": "bw 16min (15+1+0)", "context_before": 15, "context_after": 0},
     {"name": "bw 31min (30+1+0)", "context_before": 30, "context_after": 0},
     {"name": "bw 61min (60+1+0)", "context_before": 60, "context_after": 0},
+    {"name": "bw 91min (90+1+0)", "context_before": 90, "context_after": 0},
     {"name": "bw 121min (120+1+0)", "context_before": 120, "context_after": 0},
+    {"name": "bw 181min (180+1+0)", "context_before": 180, "context_after": 0},
     {"name": "bw 241min (240+1+0)", "context_before": 240, "context_after": 0},
     {"name": "bw 361min (360+1+0)", "context_before": 360, "context_after": 0},
     {"name": "bw 481min (480+1+0)", "context_before": 480, "context_after": 0},
     {"name": "bw 721min (720+1+0)", "context_before": 720, "context_after": 0},
     {"name": "bw 1441min (1440+1+0)", "context_before": 1440, "context_after": 0},
+    {"name": "bw 2161min (2160+1+0)", "context_before": 2160, "context_after": 0},
 ]
 
 # Subgroup A3: Asymmetric Past-Heavy (22 configs) — practical deployment
@@ -155,7 +161,7 @@ CONTEXT_ASYM_PAST = [
     {"name": "asym 720p+100f (720+1+100)", "context_before": 720, "context_after": 100},
 ]
 
-# Subgroup A4: Future Sensitivity Analysis (12 configs)
+# Subgroup A4: Future Sensitivity Analysis (19 configs)
 # Fixed past, systematically varying future 0→5→10→20→30→60→100.
 # Directly measures marginal value of each additional future minute.
 CONTEXT_FUTURE_SENSITIVITY = [
@@ -167,7 +173,15 @@ CONTEXT_FUTURE_SENSITIVITY = [
     {"name": "fsens 60p+30f (60+1+30)", "context_before": 60, "context_after": 30},
     {"name": "fsens 60p+60f (60+1+60)", "context_before": 60, "context_after": 60},
     {"name": "fsens 60p+100f (60+1+100)", "context_before": 60, "context_after": 100},
-    # Series 2: past=240 — long history, measure future impact
+    # Series 2: past=120 — 2h history, full future sweep
+    {"name": "fsens 120p+0f (120+1+0)", "context_before": 120, "context_after": 0},
+    {"name": "fsens 120p+5f (120+1+5)", "context_before": 120, "context_after": 5},
+    {"name": "fsens 120p+10f (120+1+10)", "context_before": 120, "context_after": 10},
+    {"name": "fsens 120p+20f (120+1+20)", "context_before": 120, "context_after": 20},
+    {"name": "fsens 120p+30f (120+1+30)", "context_before": 120, "context_after": 30},
+    {"name": "fsens 120p+60f (120+1+60)", "context_before": 120, "context_after": 60},
+    {"name": "fsens 120p+100f (120+1+100)", "context_before": 120, "context_after": 100},
+    # Series 3: past=240 — long history, measure future impact
     {"name": "fsens 240p+0f (240+1+0)", "context_before": 240, "context_after": 0},
     {"name": "fsens 240p+10f (240+1+10)", "context_before": 240, "context_after": 10},
     {"name": "fsens 240p+30f (240+1+30)", "context_before": 240, "context_after": 30},
@@ -175,43 +189,48 @@ CONTEXT_FUTURE_SENSITIVITY = [
     {"name": "fsens 240p+100f (240+1+100)", "context_before": 240, "context_after": 100},
 ]
 
-# All context configs for Group A (58 experiments)
+# All context configs for Group A (70 experiments)
 ALL_CONTEXT_CONFIGS = (
     CONTEXT_SYMMETRIC + CONTEXT_BACKWARD
     + CONTEXT_ASYM_PAST + CONTEXT_FUTURE_SENSITIVITY
 )
 
 # ── Group B: Channel Ablation at multiple contexts ──────────────────
-# Test at 3 representative context sizes (all ≤ MAX_CONTEXT_AFTER=100)
+# Test at 4 representative context sizes (all ≤ MAX_CONTEXT_AFTER=100)
 GROUP_B_CONTEXTS = [
+    {"name": "21min", "context_before": 10, "context_after": 10},
     {"name": "61min", "context_before": 30, "context_after": 30},
     {"name": "121min", "context_before": 60, "context_after": 60},
     {"name": "201min", "context_before": 100, "context_after": 100},
 ]
 
-# 21 channel combinations
+# 25 channel combinations
 CHANNEL_CONFIGS = [
-    # Single channels
+    # Single channels (6)
     {"name": "M only", "channels": ["d620900d_motionSensor"]},
     {"name": "P only", "channels": ["f2e891c6_powerMeter"]},
     {"name": "T1 only", "channels": ["d620900d_temperatureMeasurement"]},
     {"name": "T2 only", "channels": ["ccea734e_temperatureMeasurement"]},
     {"name": "C only", "channels": ["408981c2_contactSensor"]},
     {"name": "E only", "channels": ["408981c2_temperatureMeasurement"]},
-    # Pairs
+    # Pairs (11)
     {"name": "M+C", "channels": ["d620900d_motionSensor", "408981c2_contactSensor"]},
     {"name": "M+T1", "channels": ["d620900d_motionSensor", "d620900d_temperatureMeasurement"]},
     {"name": "M+P", "channels": ["d620900d_motionSensor", "f2e891c6_powerMeter"]},
     {"name": "M+T2", "channels": ["d620900d_motionSensor", "ccea734e_temperatureMeasurement"]},
-    {"name": "T1+C", "channels": ["d620900d_temperatureMeasurement", "408981c2_contactSensor"]},
-    {"name": "P+C", "channels": ["f2e891c6_powerMeter", "408981c2_contactSensor"]},
     {"name": "M+E", "channels": ["d620900d_motionSensor", "408981c2_temperatureMeasurement"]},
-    # Triples
+    {"name": "T1+T2", "channels": ["d620900d_temperatureMeasurement", "ccea734e_temperatureMeasurement"]},
+    {"name": "T1+C", "channels": ["d620900d_temperatureMeasurement", "408981c2_contactSensor"]},
+    {"name": "P+T1", "channels": ["f2e891c6_powerMeter", "d620900d_temperatureMeasurement"]},
+    {"name": "P+T2", "channels": ["f2e891c6_powerMeter", "ccea734e_temperatureMeasurement"]},
+    {"name": "P+C", "channels": ["f2e891c6_powerMeter", "408981c2_contactSensor"]},
+    {"name": "C+E", "channels": ["408981c2_contactSensor", "408981c2_temperatureMeasurement"]},
+    # Triples (4)
     {"name": "M+C+T1", "channels": ["d620900d_motionSensor", "408981c2_contactSensor", "d620900d_temperatureMeasurement"]},
     {"name": "M+C+P", "channels": ["d620900d_motionSensor", "408981c2_contactSensor", "f2e891c6_powerMeter"]},
     {"name": "M+P+T1", "channels": ["d620900d_motionSensor", "f2e891c6_powerMeter", "d620900d_temperatureMeasurement"]},
     {"name": "M+C+E", "channels": ["d620900d_motionSensor", "408981c2_contactSensor", "408981c2_temperatureMeasurement"]},
-    # Quads and more
+    # Quads and more (4)
     {"name": "M+P+T1+T2", "channels": ["d620900d_motionSensor", "f2e891c6_powerMeter", "d620900d_temperatureMeasurement", "ccea734e_temperatureMeasurement"]},
     {"name": "M+C+P+T1", "channels": ["d620900d_motionSensor", "408981c2_contactSensor", "f2e891c6_powerMeter", "d620900d_temperatureMeasurement"]},
     {"name": "M+C+P+T1+T2", "channels": ["d620900d_motionSensor", "408981c2_contactSensor", "f2e891c6_powerMeter", "d620900d_temperatureMeasurement", "ccea734e_temperatureMeasurement"]},
@@ -219,7 +238,10 @@ CHANNEL_CONFIGS = [
 ]
 
 # ── Group C: Classifier × Layer at Long Contexts ───────────────────
-CLASSIFIER_NAMES = ["random_forest", "svm", "nearest_centroid"]
+CLASSIFIER_NAMES = [
+    "random_forest", "svm", "nearest_centroid",
+    "logistic_regression", "gradient_boosting", "extra_trees",
+]
 GROUP_C_CONTEXTS = [
     {"name": "121min", "context_before": 60, "context_after": 60},
     {"name": "201min", "context_before": 100, "context_after": 100},
@@ -333,7 +355,12 @@ def extract_embeddings(model, dataset: OccupancyDataset, device: str) -> np.ndar
 
 def build_classifier(name: str, seed: int = 42):
     """Build sklearn classifier by name."""
-    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.ensemble import (
+        ExtraTreesClassifier,
+        GradientBoostingClassifier,
+        RandomForestClassifier,
+    )
+    from sklearn.linear_model import LogisticRegression
     from sklearn.neighbors import NearestCentroid
     from sklearn.svm import SVC
 
@@ -343,6 +370,14 @@ def build_classifier(name: str, seed: int = 42):
         return SVC(kernel="rbf", C=1.0, probability=True, random_state=seed)
     elif name == "nearest_centroid":
         return NearestCentroid()
+    elif name == "logistic_regression":
+        return LogisticRegression(max_iter=1000, random_state=seed, n_jobs=-1)
+    elif name == "gradient_boosting":
+        return GradientBoostingClassifier(
+            n_estimators=200, max_depth=5, learning_rate=0.1, random_state=seed,
+        )
+    elif name == "extra_trees":
+        return ExtraTreesClassifier(n_estimators=200, random_state=seed, n_jobs=-1)
     else:
         raise ValueError(f"Unknown classifier: {name}")
 
@@ -401,7 +436,7 @@ def run_train_test_eval(
 def run_group_a(cfg: dict, device: str, output_dir: Path) -> list[dict]:
     """Deep context window exploration with RF classifier.
 
-    14 symmetric + 10 backward + 22 asym-past + 12 future-sens = 58 configs.
+    16 symmetric + 13 backward + 22 asym-past + 19 future-sens = 70 configs.
     Fixed: L2 (best layer from initial round), RF, M+C, combined token.
     Future context capped at MAX_CONTEXT_AFTER=100.
     Uses unified sensor array with date-based label split (no data leakage).
@@ -519,7 +554,7 @@ def run_group_a(cfg: dict, device: str, output_dir: Path) -> list[dict]:
 def run_group_b(cfg: dict, device: str, output_dir: Path) -> list[dict]:
     """Channel ablation at multiple context sizes.
 
-    21 channel combos × 3 contexts (61min, 121min, 201min) = 63 experiments.
+    25 channel combos × 4 contexts (21min, 61min, 121min, 201min) = 100 experiments.
     Fixed: L2 (best), RF, combined token.
     Goal: Check if channel importance varies with context length.
     Uses unified sensor array — context windows can cross split boundary.
@@ -628,7 +663,7 @@ def run_group_b(cfg: dict, device: str, output_dir: Path) -> list[dict]:
 def run_group_c(cfg: dict, device: str, output_dir: Path) -> list[dict]:
     """Classifier × Layer sweep at long contexts.
 
-    3 classifiers × 6 layers × 3 contexts (121, 201, 341_asym min) = 54 experiments.
+    6 classifiers × 6 layers × 3 contexts (121, 201, 341_asym min) = 108 experiments.
     Fixed: M+C channels, combined token.
     Goal: Find best classifier/layer at contexts where it matters.
     Uses unified sensor array — context windows can cross split boundary.

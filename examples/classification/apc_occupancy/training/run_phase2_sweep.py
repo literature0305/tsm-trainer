@@ -17,42 +17,42 @@ Phase 1 findings (to beat):
 
 Six sweep groups reorganized for 3-way parallel execution:
 
-  GPU 1: Group D + E — Augmentation x Head + Context Window (~216 experiments)
+  GPU 1: Group D + E — Augmentation x Head + Context Window (~360 experiments)
 
-  Group D — Augmentation x Head Architecture (120 experiments)
-    - 10 augmentation strategies x 12 head architectures
+  Group D — Augmentation x Head Architecture (144 experiments)
+    - 12 augmentation strategies x 12 head architectures
     - Fixed: M+C+T1, 251min, L2
     - Goal: Find best augmentation + head combination
 
-  Group E — Context Window Exploration (96 experiments)
-    - 12 context sizes x 2 channel configs x 4 classifiers
+  Group E — Context Window Exploration (216 experiments)
+    - 12 context sizes x 3 channel configs x 6 classifiers
     - Requires re-extraction per context window
     - Goal: Confirm optimal context window for neural heads
 
-  GPU 2: Group F + G — Layer Fusion + Training Hyperparams (~170 experiments)
+  GPU 2: Group F + G — Layer Fusion + Training Hyperparams (~188 experiments)
 
   Group F — Layer x Fusion Strategy (80 experiments)
     - 6 single layers x 4 heads + concat + fusion + attention
     - Fixed: M+C+T1, 251min
     - Goal: Optimal layer utilization strategy
 
-  Group G — Training Hyperparameters (104 experiments)
+  Group G — Training Hyperparameters (108 experiments)
     - LR x WD grid + optimizer/scheduler + label smoothing + epoch/patience
-    - Batch size sweep + BS×LR interaction
+    - Batch size sweep + BS×LR interaction + class weight
     - Fixed: best defaults
     - Goal: Fine-tune training recipe
 
-  GPU 3: Group H + I — Augmentation Deep Dive + TTA/Ensemble (~138 experiments)
+  GPU 3: Group H + I — Augmentation Deep Dive + TTA/Ensemble (~142 experiments)
 
   Group H — Augmentation Deep Dive (70 experiments)
     - DC/SMOTE/FroFA/AdaptNoise/Mixup param grids + combined strategies
     - Goal: Systematic augmentation optimization
 
-  Group I — TTA + Ensemble + Final (68 experiments)
-    - TTA sweep + multi-seed ensemble + hybrid + sklearn baseline
+  Group I — TTA + Ensemble + Final (72 experiments)
+    - TTA sweep + multi-seed ensemble + hybrid + sklearn baseline + TTA+DC
     - Goal: Inference-time boosting + final comparison vs SVM
 
-Total: ~538 experiments across 3 GPU servers (6 groups).
+Total: ~690 experiments across 3 GPU servers (6 groups).
 
 Usage:
   cd examples/classification/apc_occupancy
@@ -133,6 +133,7 @@ CHANNEL_MAP = {
     "C": "408981c2_contactSensor",
     "T1": "d620900d_temperatureMeasurement",
     "T2": "ccea734e_temperatureMeasurement",
+    "E": "408981c2_temperatureMeasurement",
     "P": "f2e891c6_powerMeter",
 }
 
@@ -864,7 +865,7 @@ def _run_and_log(
 
 
 # ============================================================================
-# Group D: Augmentation x Head Architecture (120 experiments)
+# Group D: Augmentation x Head Architecture (144 experiments)
 # ============================================================================
 
 AUGMENTATION_CONFIGS_D = [
@@ -878,6 +879,8 @@ AUGMENTATION_CONFIGS_D = [
     {"name": "FroFA_s005", "pretrain_aug": None, "epoch_aug": {"strategy": "frofa", "strength": 0.05}},
     {"name": "AdaptNoise_s01", "pretrain_aug": None, "epoch_aug": {"strategy": "adaptive_noise", "scale": 0.1}},
     {"name": "WCMixup_a03", "pretrain_aug": None, "epoch_aug": {"strategy": "within_class_mixup", "alpha": 0.3}},
+    {"name": "GaussNoise_s01", "pretrain_aug": None, "epoch_aug": {"gaussian_noise_sigma": 0.1}},
+    {"name": "DC+WCMixup", "pretrain_aug": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}, "epoch_aug": {"strategy": "within_class_mixup", "alpha": 0.3}},
 ]
 
 HEAD_CONFIGS_D = [
@@ -907,10 +910,10 @@ def run_group_d(
 ) -> list[dict]:
     """Sweep augmentation x head architecture.
 
-    10 augmentations x 12 heads = 120 experiments.
+    12 augmentations x 12 heads = 144 experiments.
     """
     logger.info("=" * 70)
-    logger.info("GROUP D: Augmentation x Head Architecture (120 experiments)")
+    logger.info("GROUP D: Augmentation x Head Architecture (144 experiments)")
     logger.info("=" * 70)
 
     embed_dim = Z_train.shape[1]
@@ -948,7 +951,7 @@ def run_group_d(
 
 
 # ============================================================================
-# Group E: Context Window Exploration (96 experiments)
+# Group E: Context Window Exploration (216 experiments)
 # ============================================================================
 
 # Context configs: symmetric up to 100+1+100, then asymmetric with future=100.
@@ -972,6 +975,7 @@ GROUP_E_CONTEXTS = [
 GROUP_E_CHANNELS = [
     {"name": "M+C", "keys": ["M", "C"]},
     {"name": "M+C+T1", "keys": ["M", "C", "T1"]},
+    {"name": "M+C+T1+T2", "keys": ["M", "C", "T1", "T2"]},
 ]
 
 GROUP_E_CLASSIFIERS = [
@@ -979,6 +983,8 @@ GROUP_E_CLASSIFIERS = [
     {"name": "Linear", "type": "neural", "head_type": "linear", "head_kwargs": {}},
     {"name": "SVM_rbf", "type": "sklearn", "clf_config": {"type": "svm", "kernel": "rbf", "C": 1.0}},
     {"name": "LogReg", "type": "sklearn", "clf_config": {"type": "logistic_regression"}},
+    {"name": "GradBoost", "type": "sklearn", "clf_config": {"type": "gradient_boosting"}},
+    {"name": "ExtraTrees", "type": "sklearn", "clf_config": {"type": "extra_trees"}},
 ]
 
 
@@ -997,11 +1003,11 @@ def run_group_e(
 ) -> list[dict]:
     """Sweep context windows with neural + sklearn classifiers.
 
-    12 contexts x 2 channels x 4 classifiers = 96 experiments.
+    12 contexts x 3 channels x 6 classifiers = 216 experiments.
     Uses unified sensor array — context windows can cross split boundary.
     """
     logger.info("=" * 70)
-    logger.info("GROUP E: Context Window Exploration (96 experiments)")
+    logger.info("GROUP E: Context Window Exploration (216 experiments)")
     logger.info("=" * 70)
 
     device = train_config.device
@@ -1282,7 +1288,7 @@ def run_group_f(
 
 
 # ============================================================================
-# Group G: Training Hyperparameters (90 experiments)
+# Group G: Training Hyperparameters (108 experiments)
 # ============================================================================
 
 def run_group_g(
@@ -1296,10 +1302,10 @@ def run_group_g(
 ) -> list[dict]:
     """Sweep training hyperparameters: LR, WD, optimizer, scheduler, batch size, etc.
 
-    ~104 experiments (40+15+15+6+8+4+2+8+6).
+    ~108 experiments (40+15+15+6+8+4+2+8+6+4).
     """
     logger.info("=" * 70)
-    logger.info("GROUP G: Training Hyperparameters (~104 experiments)")
+    logger.info("GROUP G: Training Hyperparameters (~108 experiments)")
     logger.info("=" * 70)
 
     embed_dim = Z_train.shape[1]
@@ -1543,6 +1549,36 @@ def run_group_g(
         )
         results.append(row)
 
+    # Part G10: Class weight sweep = 4
+    logger.info("--- Part G10: Class weight (4 experiments) ---")
+    class_weight_configs = [
+        ("1:1", [1.0, 1.0]),
+        ("1:1.5", [1.0, 1.5]),
+        ("1.5:1", [1.5, 1.0]),
+        ("1:2", [1.0, 2.0]),
+    ]
+    for cw_name, cw in class_weight_configs:
+        exp_idx += 1
+        exp_name = f"CW={cw_name}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        tc = TrainConfig(
+            epochs=base_train_config.epochs,
+            lr=base_train_config.lr, weight_decay=base_train_config.weight_decay,
+            early_stopping_patience=base_train_config.early_stopping_patience,
+            device=base_train_config.device,
+            class_weight=cw,
+        )
+        row = _run_and_log(
+            exp_name,
+            lambda tc_=tc: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, tc_, seed=seed,
+            ),
+            extra={"group": "G", "subgroup": "class_weight", "class_weight": cw_name},
+        )
+        results.append(row)
+
     _save_group_results(results, "G", "group_g_training_hp", output_dir)
     return results
 
@@ -1740,7 +1776,7 @@ def run_group_h(
 
 
 # ============================================================================
-# Group I: TTA + Ensemble + Final (68 experiments)
+# Group I: TTA + Ensemble + Final (72 experiments)
 # ============================================================================
 
 def run_group_i(
@@ -1754,10 +1790,10 @@ def run_group_i(
 ) -> list[dict]:
     """TTA sweep, multi-seed ensemble, hybrid, sklearn baselines.
 
-    ~68 experiments.
+    ~72 experiments.
     """
     logger.info("=" * 70)
-    logger.info("GROUP I: TTA + Ensemble + Final (~68 experiments)")
+    logger.info("GROUP I: TTA + Ensemble + Final (~72 experiments)")
     logger.info("=" * 70)
 
     embed_dim = Z_train.shape[1]
@@ -1902,6 +1938,36 @@ def run_group_i(
                 default_head_factory, tc_, seed=seed,
             ),
             extra={"group": "I", "subgroup": "class_weight", "class_weight": cw_name},
+        )
+        results.append(row)
+
+    # Part I6: TTA + DC combined = 4
+    logger.info("--- Part I6: TTA + DC combined (4 experiments) ---")
+    tta_dc_configs = [
+        {"name": "TTA-5_FroFA+DC", "tta_k": 5, "tta_strategy": "frofa", "tta_strength": 0.1},
+        {"name": "TTA-10_FroFA+DC", "tta_k": 10, "tta_strategy": "frofa", "tta_strength": 0.1},
+        {"name": "TTA-5_AdaptNoise+DC", "tta_k": 5, "tta_strategy": "adaptive_noise", "tta_strength": 0.1},
+        {"name": "TTA-10_AdaptNoise+DC", "tta_k": 10, "tta_strategy": "adaptive_noise", "tta_strength": 0.1},
+    ]
+    dc_pretrain = {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}
+    for tta_cfg in tta_dc_configs:
+        exp_idx += 1
+        exp_name = tta_cfg["name"]
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        row = _run_and_log(
+            exp_name,
+            lambda tc_=tta_cfg, pa=dc_pretrain: run_tta_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, train_config,
+                tta_k=tc_["tta_k"], tta_strategy=tc_["tta_strategy"],
+                tta_strength=tc_["tta_strength"],
+                pretrain_aug_config=pa, seed=seed,
+            ),
+            extra={
+                "group": "I", "subgroup": "tta_dc",
+                "tta_k": tta_cfg["tta_k"], "tta_strategy": tta_cfg["tta_strategy"],
+            },
         )
         results.append(row)
 

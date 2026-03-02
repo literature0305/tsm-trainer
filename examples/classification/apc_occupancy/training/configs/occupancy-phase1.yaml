@@ -1,22 +1,35 @@
-# Phase 1 Comprehensive Sweep: MantisV2 Frozen Embeddings + sklearn Classifiers
+# Phase 1 Comprehensive Sweep v2: MantisV2 Frozen Embeddings + sklearn Classifiers
 #
-# Redesigned after initial round findings:
+# Redesigned for maximum coverage — ~278 experiments across 3 GPUs.
+#
+# Findings from initial round:
 #   - Context window is THE dominant factor (AUC: 0.56@1min → 0.84@241min)
 #   - Layer choice is negligible (±0.01 AUC across L0-L5)
 #   - MantisV2 only supports output_token="combined" (cls/mean fail)
 #
-# v4: Unified sensor array with date-based label split.
+# v5: Expanded sweep with more classifiers, channels, and context windows.
+#   Unified sensor array with date-based label split.
 #   Both CSVs concatenated into one continuous sensor timeline.
 #   Context windows can cross the train/test boundary (sensor overlap allowed).
 #   Labels are split by split_date — no label leakage.
 #   Label convention: -1=unlabeled, 0=empty, 1=occupied.
 #
 #   Default split: Feb 17 (maximize train data)
-#     Train labeled: ~9,570 (Feb 10 07:37 ~ Feb 16 23:59)
-#     Test labeled:  ~3,550 (Feb 17 00:00 ~ Feb 19 10:16)
+#     Train labeled: 9,623 (Feb 10 07:37 ~ Feb 16 23:59)
+#     Test labeled:  3,497 (Feb 17 00:00 ~ Feb 19 10:16)
 #     Train:Test ratio ≈ 73:27
 #
-# 3 parallel sweep groups (A/B/C) for optimal configuration search.
+#   Context window boundary safety:
+#     Train first labeled index: ~495 in unified array
+#     Unlabeled sensor data (Feb 09 23:22 ~ Feb 10 07:36) IS available
+#     as context — windows can reference unlabeled sensor rows.
+#     ctx_before <= 495 → no train sample loss.
+#
+# 3 parallel sweep groups (A/B/C):
+#   GPU 1: Group A — Context Window Deep Exploration (~70 experiments)
+#   GPU 2: Group B — Channel Ablation × Context (~100 experiments)
+#   GPU 3: Group C — Classifier × Layer × Context (~108 experiments)
+#   Total: ~278 experiments
 #
 # Usage:
 #   cd examples/classification/apc_occupancy
@@ -66,3 +79,15 @@ default_layer: 2
 default_context_before: 100
 default_context_after: 100
 stride: 1
+
+# --- Classifiers (Group C) ---
+# Expanded from 3 to 6 classifiers for comprehensive comparison:
+#   random_forest, svm, nearest_centroid (original)
+#   + logistic_regression, gradient_boosting, extra_trees (new)
+classifiers:
+  - random_forest
+  - svm
+  - nearest_centroid
+  - logistic_regression
+  - gradient_boosting
+  - extra_trees
