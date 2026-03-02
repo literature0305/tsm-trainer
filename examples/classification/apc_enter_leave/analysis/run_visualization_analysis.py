@@ -60,7 +60,7 @@ _PROJECT_DIR = _SCRIPT_DIR.parent  # apc_enter_leave/
 sys.path.insert(0, str(_PROJECT_DIR))
 
 from data.preprocess import EventPreprocessConfig, load_sensor_and_events
-from data.dataset import EventDatasetConfig, EventDataset, build_dataset_config
+from data.dataset import EventDatasetConfig, EventDataset
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +217,7 @@ def extract_embeddings(
     channels, ctx_before=2, ctx_after=2,
 ):
     """Build dataset and extract embeddings. Returns (Z, y)."""
-    ds_cfg = build_dataset_config(
+    ds_cfg = EventDatasetConfig(
         context_mode="bidirectional",
         context_before=ctx_before,
         context_after=ctx_after,
