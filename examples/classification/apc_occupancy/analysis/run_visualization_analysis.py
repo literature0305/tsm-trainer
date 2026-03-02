@@ -58,37 +58,43 @@ from data.dataset import DatasetConfig, OccupancyDataset
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Color palette (ColorBrewer diverging — colorblind-safe, print-friendly)
+# Color palette (matplotlib tab10 — universally recognized, high contrast)
 # ---------------------------------------------------------------------------
 CLASS_COLORS = {
-    0: "#4393C3",  # Empty    — steel blue (cool)
-    1: "#D6604D",  # Occupied — terra/coral (warm)
+    0: "#1f77b4",  # Empty    — standard blue (cool/absence)
+    1: "#ff7f0e",  # Occupied — standard orange (warm/presence)
 }
 CLASS_NAMES = {0: "Empty", 1: "Occupied"}
-MODEL_BLUE = "#2166AC"   # sklearn accent
-MODEL_RED = "#D6604D"    # neural accent
+ACCENT_GREEN = "#2ca02c"  # correct / positive
+ACCENT_RED = "#d62728"    # error / negative
 DPI = 300
 
 
 def setup_style():
-    """Apply clean publication rcParams."""
+    """Apply publication-quality rcParams with refined typography."""
     mpl.rcParams.update({
         "figure.dpi": DPI,
         "savefig.dpi": DPI,
         "savefig.bbox": "tight",
-        "savefig.pad_inches": 0.15,
+        "savefig.pad_inches": 0.1,
         "font.family": "sans-serif",
         "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-        "font.size": 10,
-        "axes.titlesize": 12,
-        "axes.labelsize": 10,
-        "xtick.labelsize": 9,
-        "ytick.labelsize": 9,
-        "legend.fontsize": 9,
-        "axes.grid": False,
+        "font.size": 9,
+        "axes.titlesize": 11,
+        "axes.labelsize": 9,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "legend.fontsize": 7.5,
+        "legend.title_fontsize": 8,
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "grid.linewidth": 0.4,
+        "grid.color": "#CCCCCC",
         "axes.spines.top": False,
         "axes.spines.right": False,
-        "axes.linewidth": 0.8,
+        "axes.linewidth": 0.6,
+        "axes.facecolor": "#FAFAFA",
+        "figure.facecolor": "white",
     })
 
 
@@ -107,7 +113,7 @@ def save_fig(fig, output_dir: Path, name: str):
 # ============================================================================
 
 def tsne_2d(Z: np.ndarray, seed: int = 42, pca_pre: int = 50) -> np.ndarray:
-    """Scale → PCA pre-reduction → t-SNE to 2D."""
+    """Scale -> PCA pre-reduction -> t-SNE to 2D."""
     n, d = Z.shape
     X = StandardScaler().fit_transform(Z)
     n_pre = min(pca_pre, d, n)
@@ -300,7 +306,7 @@ def fig1_train_test_embeddings(Z_train, y_train, Z_test, y_test,
     # Joint reduction for shared coordinate space
     [emb_tr, emb_te] = tsne_2d_joint(Ztr_viz, Zte_viz)
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
 
     for col, (emb, y, title_prefix) in enumerate([
         (emb_tr, ytr_viz, "Train Set"),
@@ -313,24 +319,24 @@ def fig1_train_test_embeddings(Z_train, y_train, Z_test, y_test,
                 ax.scatter(
                     emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
                     label=f"{CLASS_NAMES[cls]} ({m.sum()})",
-                    s=20, alpha=0.55, edgecolors="white", linewidths=0.2,
+                    s=15, alpha=0.55, edgecolors="white", linewidths=0.15,
                 )
         n_total = len(y)
         ax.set_title(
-            f"{title_prefix} (N={n_total})", fontsize=12, fontweight="bold",
+            f"{title_prefix} (N={n_total})", fontsize=11, fontweight="bold",
         )
         ax.set_xlabel("t-SNE 1")
         ax.set_ylabel("t-SNE 2")
         ax.legend(
-            loc="upper right", frameon=True, framealpha=0.9,
-            edgecolor="#CCCCCC", markerscale=1.8,
+            loc="lower right", frameon=True, framealpha=0.7,
+            edgecolor="#CCCCCC", fontsize=7, markerscale=1.5,
         )
 
     fig.suptitle(
         "Occupancy Embedding Space: Train vs Test\n"
         "(MantisV2 L2, M+C+T1, 125+1+125 bidirectional, "
         "split at 2026-02-15)",
-        fontsize=13, fontweight="bold", y=1.04,
+        fontsize=12, fontweight="bold", y=1.03,
     )
     fig.tight_layout()
     save_fig(fig, output_dir, "fig1_train_test_embeddings")
@@ -355,11 +361,11 @@ def fig2_classification_overlay(Z_test, y_test, y_pred_svm, y_pred_mlp,
     # Shared t-SNE embedding
     emb = tsne_2d(Z_viz)
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
 
-    for col, (name, y_pred, accent) in enumerate([
-        ("SVM_rbf (sklearn)", pred_svm_viz, MODEL_BLUE),
-        ("MLP[128]-d0.5 (neural)", pred_mlp_viz, MODEL_RED),
+    for col, (name, y_pred) in enumerate([
+        ("SVM_rbf (sklearn)", pred_svm_viz),
+        ("MLP[128]-d0.5 (neural)", pred_mlp_viz),
     ]):
         ax = axes[col]
         correct = y_viz == y_pred
@@ -371,16 +377,16 @@ def fig2_classification_overlay(Z_test, y_test, y_pred_svm, y_pred_mlp,
             if m.any():
                 ax.scatter(
                     emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
-                    label=f"{CLASS_NAMES[cls]} (correct)",
-                    s=18, alpha=0.5, edgecolors="white", linewidths=0.2,
+                    label=CLASS_NAMES[cls],
+                    s=14, alpha=0.5, edgecolors="white", linewidths=0.15,
                 )
 
-        # Misclassified samples
+        # Misclassified samples: distinct red X markers
         if incorrect.any():
             ax.scatter(
                 emb[incorrect, 0], emb[incorrect, 1],
-                c=[CLASS_COLORS[int(c)] for c in y_viz[incorrect]],
-                s=80, alpha=1.0, edgecolors="#222222", linewidths=1.8,
+                c=ACCENT_RED,
+                s=30, alpha=0.9, edgecolors="#333333", linewidths=0.8,
                 marker="X", zorder=10, label="Misclassified",
             )
 
@@ -390,19 +396,19 @@ def fig2_classification_overlay(Z_test, y_test, y_pred_svm, y_pred_mlp,
         ax.set_title(
             f"{name}\n"
             f"Accuracy = {acc:.2f}%  ({n_err}/{n_total} errors)",
-            fontsize=11, fontweight="bold",
+            fontsize=10, fontweight="bold",
         )
         ax.set_xlabel("t-SNE 1")
         ax.set_ylabel("t-SNE 2")
         ax.legend(
-            fontsize=7, loc="upper right", frameon=True, framealpha=0.9,
-            edgecolor="#CCCCCC", markerscale=0.8,
+            fontsize=7, loc="lower right", frameon=True, framealpha=0.7,
+            edgecolor="#CCCCCC", markerscale=0.9,
         )
 
     fig.suptitle(
         "Test Set Classification: SVM_rbf vs MLP[128]-d0.5\n"
         "(MantisV2 L2, M+C+T1, 125+1+125 bidirectional)",
-        fontsize=13, fontweight="bold", y=1.04,
+        fontsize=12, fontweight="bold", y=1.03,
     )
     fig.tight_layout()
     save_fig(fig, output_dir, "fig2_classification_overlay")
@@ -438,7 +444,7 @@ def fig3_decision_boundary(Z_train, y_train, Z_test, y_test,
     ev1 = pca.explained_variance_ratio_[0]
     ev2 = pca.explained_variance_ratio_[1]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
 
     for col, (name, y_pred) in enumerate([
         ("SVM_rbf (sklearn)", pred_svm_sub),
@@ -463,12 +469,12 @@ def fig3_decision_boundary(Z_train, y_train, Z_test, y_test,
         zz = clf_2d.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
 
         ax.contourf(
-            xx, yy, zz, alpha=0.12, levels=[-0.5, 0.5, 1.5],
+            xx, yy, zz, alpha=0.10, levels=[-0.5, 0.5, 1.5],
             colors=[CLASS_COLORS[0], CLASS_COLORS[1]],
         )
         ax.contour(
             xx, yy, zz, levels=[0.5], colors=["#444444"],
-            linewidths=1.5, alpha=0.6, linestyles="--",
+            linewidths=1.2, alpha=0.5, linestyles="--",
         )
 
         # Test points
@@ -479,28 +485,31 @@ def fig3_decision_boundary(Z_train, y_train, Z_test, y_test,
             if m.any():
                 ax.scatter(
                     Z_2d_test[m, 0], Z_2d_test[m, 1], c=CLASS_COLORS[cls],
-                    s=15, alpha=0.5, edgecolors="white", linewidths=0.2,
+                    s=12, alpha=0.5, edgecolors="white", linewidths=0.15,
                     label=CLASS_NAMES[cls],
                 )
         if incorrect.any():
             ax.scatter(
                 Z_2d_test[incorrect, 0], Z_2d_test[incorrect, 1],
-                c="#222222", s=40, marker="X", alpha=0.9, zorder=10,
+                c=ACCENT_RED, s=25, marker="X", alpha=0.9, zorder=10,
+                edgecolors="#333333", linewidths=0.6,
                 label="Error",
             )
 
         acc = 100 * correct.mean()
-        ax.set_title(f"{name}\nAcc = {acc:.2f}%", fontsize=11,
+        ax.set_title(f"{name}\nAcc = {acc:.2f}%", fontsize=10,
                      fontweight="bold")
         ax.set_xlabel(f"PC1 ({ev1:.1%})")
         ax.set_ylabel(f"PC2 ({ev2:.1%})")
-        ax.legend(fontsize=8, loc="upper right", frameon=True, framealpha=0.9,
-                  edgecolor="#CCCCCC", markerscale=1.3)
+        ax.legend(
+            fontsize=7, loc="lower right", frameon=True, framealpha=0.7,
+            edgecolor="#CCCCCC", markerscale=1.0,
+        )
 
     fig.suptitle(
         "Decision Boundary (PCA 2D): SVM_rbf vs MLP\n"
         "(L2, M+C+T1, 125+1+125 bidirectional)",
-        fontsize=13, fontweight="bold", y=1.04,
+        fontsize=12, fontweight="bold", y=1.03,
     )
     fig.tight_layout()
     save_fig(fig, output_dir, "fig3_decision_boundary")
@@ -530,18 +539,19 @@ def fig4_uncertainty_analysis(Z_test, y_test, y_prob_svm, y_prob_mlp,
 
     emb = tsne_2d(Z_viz)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9.5))
 
     # ---- (a) SVM entropy heatmap ----
     ax = axes[0, 0]
     sc = ax.scatter(
         emb[:, 0], emb[:, 1], c=ent_svm, cmap="YlOrRd",
-        s=20, alpha=0.8, vmin=0, vmax=max_ent, edgecolors="white",
-        linewidths=0.2,
+        s=14, alpha=0.8, vmin=0, vmax=max_ent, edgecolors="white",
+        linewidths=0.15,
     )
-    cbar = fig.colorbar(sc, ax=ax, shrink=0.8, pad=0.02)
-    cbar.set_label("Entropy", fontsize=9)
-    ax.set_title("(a) SVM — Prediction Entropy", fontsize=11,
+    cbar = fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02, aspect=25)
+    cbar.set_label("Entropy", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+    ax.set_title("(a) SVM \u2014 Prediction Entropy", fontsize=10,
                  fontweight="bold")
     ax.set_xlabel("t-SNE 1")
     ax.set_ylabel("t-SNE 2")
@@ -550,12 +560,13 @@ def fig4_uncertainty_analysis(Z_test, y_test, y_prob_svm, y_prob_mlp,
     ax = axes[0, 1]
     sc = ax.scatter(
         emb[:, 0], emb[:, 1], c=ent_mlp, cmap="YlOrRd",
-        s=20, alpha=0.8, vmin=0, vmax=max_ent, edgecolors="white",
-        linewidths=0.2,
+        s=14, alpha=0.8, vmin=0, vmax=max_ent, edgecolors="white",
+        linewidths=0.15,
     )
-    cbar = fig.colorbar(sc, ax=ax, shrink=0.8, pad=0.02)
-    cbar.set_label("Entropy", fontsize=9)
-    ax.set_title("(b) MLP — Prediction Entropy", fontsize=11,
+    cbar = fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02, aspect=25)
+    cbar.set_label("Entropy", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+    ax.set_title("(b) MLP \u2014 Prediction Entropy", fontsize=10,
                  fontweight="bold")
     ax.set_xlabel("t-SNE 1")
     ax.set_ylabel("t-SNE 2")
@@ -570,64 +581,71 @@ def fig4_uncertainty_analysis(Z_test, y_test, y_prob_svm, y_prob_mlp,
     if correct_both.any():
         ax.scatter(
             ent_svm[correct_both], ent_mlp[correct_both],
-            c="#AAAAAA", s=12, alpha=0.35, label="Both correct",
+            c="#BBBBBB", s=10, alpha=0.3, label="Both correct",
         )
     if wrong_both.any():
         ax.scatter(
             ent_svm[wrong_both], ent_mlp[wrong_both],
-            c="#B2182B", s=80, alpha=1.0, marker="X",
-            edgecolors="#222222", linewidths=0.8,
+            c=ACCENT_RED, s=30, alpha=1.0, marker="X",
+            edgecolors="#333333", linewidths=0.7,
             label="Both wrong", zorder=10,
         )
     if svm_wrong.any():
         ax.scatter(
             ent_svm[svm_wrong], ent_mlp[svm_wrong],
-            c=MODEL_BLUE, s=55, alpha=0.9, marker="s",
-            edgecolors="#222222", linewidths=0.4,
+            c="#1f77b4", s=22, alpha=0.9, marker="s",
+            edgecolors="#333333", linewidths=0.4,
             label="SVM wrong only", zorder=9,
         )
     if mlp_wrong.any():
         ax.scatter(
             ent_svm[mlp_wrong], ent_mlp[mlp_wrong],
-            c=MODEL_RED, s=55, alpha=0.9, marker="^",
-            edgecolors="#222222", linewidths=0.4,
+            c="#ff7f0e", s=22, alpha=0.9, marker="^",
+            edgecolors="#333333", linewidths=0.4,
             label="MLP wrong only", zorder=9,
         )
-    ax.plot([0, max_ent], [0, max_ent], "k--", alpha=0.25, linewidth=1)
+    ax.plot([0, max_ent], [0, max_ent], "k--", alpha=0.2, linewidth=0.8)
     ax.set_xlabel("SVM Entropy")
     ax.set_ylabel("MLP Entropy")
     ax.set_title(
-        "(c) Per-Sample Entropy: SVM vs MLP", fontsize=11, fontweight="bold",
+        "(c) Per-Sample Entropy: SVM vs MLP", fontsize=10, fontweight="bold",
     )
-    ax.legend(fontsize=8, frameon=True, framealpha=0.9, edgecolor="#CCCCCC")
+    ax.legend(
+        fontsize=7, frameon=True, framealpha=0.7, edgecolor="#CCCCCC",
+        loc="lower right", markerscale=0.9,
+    )
 
     # ---- (d) Confidence (max prob) comparison ----
     ax = axes[1, 1]
     conf_svm = prob_svm.max(axis=1)
     conf_mlp = prob_mlp.max(axis=1)
-    colors = np.where(y_viz == pred_svm, "#4393C3", "#D6604D")
-    ax.scatter(conf_svm, conf_mlp, c=colors, s=15, alpha=0.5)
-    ax.plot([0.5, 1], [0.5, 1], "k--", alpha=0.25, linewidth=1)
+    colors = np.where(y_viz == pred_svm, ACCENT_GREEN, ACCENT_RED)
+    ax.scatter(conf_svm, conf_mlp, c=colors, s=12, alpha=0.5,
+               edgecolors="white", linewidths=0.15)
+    ax.plot([0.5, 1], [0.5, 1], "k--", alpha=0.2, linewidth=0.8)
     ax.set_xlabel("SVM Max Probability")
     ax.set_ylabel("MLP Max Probability")
-    ax.set_title("(d) Prediction Confidence", fontsize=11, fontweight="bold")
+    ax.set_title("(d) Prediction Confidence", fontsize=10, fontweight="bold")
     ax.set_xlim(0.45, 1.02)
     ax.set_ylim(0.45, 1.02)
     legend_elems = [
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#4393C3",
-               markersize=7, label="Correct (SVM)"),
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#D6604D",
-               markersize=7, label="Incorrect (SVM)"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=ACCENT_GREEN,
+               markersize=5.5, label="Correct (SVM)"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=ACCENT_RED,
+               markersize=5.5, label="Incorrect (SVM)"),
     ]
-    ax.legend(handles=legend_elems, fontsize=8, frameon=True, framealpha=0.9,
-              edgecolor="#CCCCCC")
+    ax.legend(
+        handles=legend_elems, fontsize=7,
+        frameon=True, framealpha=0.7, edgecolor="#CCCCCC",
+        loc="lower right",
+    )
 
     fig.suptitle(
         "Uncertainty & Confidence Analysis: SVM_rbf vs MLP[128]-d0.5\n"
         "(Test set, L2, M+C+T1, 125+1+125)",
-        fontsize=13, fontweight="bold", y=1.02,
+        fontsize=12, fontweight="bold", y=1.01,
     )
-    fig.subplots_adjust(hspace=0.30, wspace=0.30)
+    fig.subplots_adjust(hspace=0.28, wspace=0.28)
     save_fig(fig, output_dir, "fig4_uncertainty_analysis")
 
 
@@ -744,7 +762,7 @@ def main():
     logger.info("All figures saved to: %s", output_dir.resolve())
     logger.info("Total time: %.1fs", elapsed)
     logger.info(
-        "Summary — SVM: %.2f%% (%d errors) | MLP: %.2f%% (%d errors)",
+        "Summary -- SVM: %.2f%% (%d errors) | MLP: %.2f%% (%d errors)",
         acc_svm, (y_test != y_pred_svm).sum(),
         acc_mlp, (y_test != y_pred_mlp).sum(),
     )
