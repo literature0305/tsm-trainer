@@ -166,8 +166,11 @@ def _extract_embeddings(raw_cfg, include_none, device, layer, ctx_before,
     pretrained_name = model_cfg.get("pretrained_name", "paris-noah/MantisV2")
     output_token = model_cfg.get("output_token", "combined")
 
-    model = load_mantis_model(pretrained_name, layer, output_token, device)
+    network, model = load_mantis_model(pretrained_name, layer, output_token, device)
     Z = extract_all_embeddings(model, dataset)
+    del model, network
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     labels = dataset.event_labels
     return Z, labels, class_names

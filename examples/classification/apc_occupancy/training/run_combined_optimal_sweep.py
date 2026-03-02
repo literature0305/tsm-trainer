@@ -232,7 +232,9 @@ def evaluate_neural(Z_train, y_train, Z_test, y_test, head_config, train_config,
     input_dim = Z_tr.shape[1]
     n_classes = len(np.unique(y_train))
 
-    head = build_head(head_config, input_dim, n_classes)
+    head_type = head_config.get("type", "linear")
+    head_kwargs = {k: v for k, v in head_config.items() if k != "type"}
+    head = build_head(head_type, input_dim, n_classes, **head_kwargs)
     head = train_head(head, Z_tr, y_tr, train_config, n_classes)
 
     device = torch.device(train_config.device)
