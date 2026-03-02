@@ -172,8 +172,7 @@ def _extract_embeddings(raw_cfg, include_none, device, layer, ctx_before,
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    labels = dataset.event_labels
-    return Z, labels, class_names
+    return Z, event_labels, class_names
 
 
 # ============================================================================
