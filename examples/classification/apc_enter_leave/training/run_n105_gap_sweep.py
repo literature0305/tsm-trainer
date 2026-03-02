@@ -198,7 +198,10 @@ def run_sklearn_loocv(Z, y, clf_name, class_names):
         clf.fit(Z_train_s, y_train)
         all_preds[i] = clf.predict(Z_test_s)[0]
 
-    metrics = aggregate_cv_predictions(y, all_preds, class_names)
+    metrics = aggregate_cv_predictions(
+        y, all_preds, None,
+        cv_method="LOOCV", n_folds=n, class_names=class_names,
+    )
     return metrics, all_preds
 
 
