@@ -43,7 +43,7 @@ model:
 # Source sensor: merged_processed_data_with_motion_count_0209_0223_interval1.csv
 # Source events: occupancy_events_0210_0219_processed_with_none_cleaned.csv
 # Binary: count >= 1 = Occupied, count = 0 = Empty, -1 = Unlabeled.
-# Train labeled: 8,184 (Occupied 48.4%, Empty 51.6%)
+# Train labeled: 8,183 (Occupied 47.7%, Empty 52.3%)
 # Test labeled:  4,937 (Occupied 48.6%, Empty 51.4%)
 data:
   train_csv: "/group-volume/ts-dataset/AIHub/enter_leave/merged_processed_data_with_motion_count_0209_0223_interval1_train_with_occupancy_label.csv"
