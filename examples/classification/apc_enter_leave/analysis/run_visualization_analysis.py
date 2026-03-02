@@ -12,6 +12,9 @@ Figures (saved as PNG + PDF):
   Fig 2 — Collision proof: Indistinguishable collision pairs highlighted
   Fig 3 — Classification overlay: RF vs MLP on N=105 (correct/incorrect)
   Fig 4 — Uncertainty analysis: Per-sample entropy & confidence comparison
+  Fig 5 — Layer ablation: L0-L5 embedding quality comparison
+  Fig 6 — Context window ablation: Impact of temporal context size
+  Fig 7 — Channel ablation: Contribution of each sensor channel
 
 Usage:
     cd examples/classification/apc_enter_leave
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import logging
 import os
 import sys
@@ -125,18 +129,6 @@ def tsne_2d(Z: np.ndarray, seed: int = 42, pca_pre: int = 50) -> np.ndarray:
     ).fit_transform(X)
 
 
-def tsne_2d_joint(*arrays, seed=42, pca_pre=50):
-    """Reduce multiple arrays in shared coordinate space."""
-    sizes = [len(a) for a in arrays]
-    combined = np.concatenate(arrays, axis=0)
-    reduced = tsne_2d(combined, seed=seed, pca_pre=pca_pre)
-    result, offset = [], 0
-    for s in sizes:
-        result.append(reduced[offset:offset + s])
-        offset += s
-    return result
-
-
 # ============================================================================
 # Data & model helpers
 # ============================================================================
@@ -197,10 +189,7 @@ def extract_embeddings(
 
 
 def detect_collision_pairs(event_ts, event_labels):
-    """Find collision pairs (same-timestamp, different labels).
-
-    Returns (pairs, dup_indices) where pairs is list of (idx_a, idx_b).
-    """
+    """Find collision pairs (same-timestamp, different labels)."""
     import pandas as pd
     ts_series = pd.Series(event_labels, index=pd.DatetimeIndex(event_ts))
     dup_mask = ts_series.index.duplicated(keep=False)
@@ -321,20 +310,21 @@ def run_mlp_loocv(Z, y, embed_dim, device="cpu", seed=42):
 
 # ============================================================================
 # Figure 1: N=109 vs N=105 Comparison
+# Scenario: Shows the impact of removing 4 timestamp-collision events.
+#   Collision events share identical sensor windows but carry different
+#   labels, making them theoretically unresolvable.
 # ============================================================================
 
-def fig1_n109_vs_n105(Z_109, y_109, Z_105, y_105, output_dir: Path):
+def fig1_n109_vs_n105(emb_109, y_109, emb_105, y_105, output_dir: Path):
     """Side-by-side t-SNE: N=109 (with collisions) vs N=105 (cleaned)."""
     setup_style()
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    for col, (Z, y, title, n_label) in enumerate([
-        (Z_109, y_109, "N=109 (with collisions)", "109"),
-        (Z_105, y_105, "N=105 (cleaned)", "105"),
+    for col, (emb, y, title) in enumerate([
+        (emb_109, y_109, "N=109 (with collisions)"),
+        (emb_105, y_105, "N=105 (cleaned)"),
     ]):
-        emb = tsne_2d(Z)
         ax = axes[col]
-
         for cls in sorted(CLASS_COLORS):
             m = y == cls
             if m.any():
@@ -343,7 +333,6 @@ def fig1_n109_vs_n105(Z_109, y_109, Z_105, y_105, output_dir: Path):
                     c=CLASS_COLORS[cls], label=f"{CLASS_NAMES[cls]} ({m.sum()})",
                     s=25, alpha=0.7, edgecolors="white", linewidths=0.3,
                 )
-
         ax.set_title(title, fontsize=11, fontweight="bold")
         ax.set_xlabel("t-SNE 1")
         ax.set_ylabel("t-SNE 2")
@@ -363,96 +352,83 @@ def fig1_n109_vs_n105(Z_109, y_109, Z_105, y_105, output_dir: Path):
 
 # ============================================================================
 # Figure 2: Collision Proof
+# Scenario: Proves that collision events occupy identical positions in
+#   embedding space (connected by dashed lines) — different labels but
+#   indistinguishable input, guaranteeing classification errors.
 # ============================================================================
 
-def fig2_collision_analysis(Z_109, y_109, event_ts_109, output_dir: Path):
+def fig2_collision_analysis(emb_109, y_109, pairs, dup_indices,
+                             output_dir: Path):
     """Highlight collision samples — identical embeddings, different labels."""
     setup_style()
-    pairs, dup_indices = detect_collision_pairs(event_ts_109, y_109)
-
     if len(dup_indices) == 0:
         logger.warning("No collision events detected; skipping Fig 2")
         return
 
-    emb = tsne_2d(Z_109)
-
     fig, ax = plt.subplots(figsize=(8, 7))
 
-    # Background: all non-collision samples (faded)
+    # Background: non-collision (faded)
     non_dup = np.ones(len(y_109), dtype=bool)
     non_dup[dup_indices] = False
     for cls in sorted(CLASS_COLORS):
         m = (y_109 == cls) & non_dup
         if m.any():
-            ax.scatter(
-                emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
-                label=CLASS_NAMES[cls], s=15, alpha=0.25, edgecolors="none",
-            )
+            ax.scatter(emb_109[m, 0], emb_109[m, 1], c=CLASS_COLORS[cls],
+                       label=CLASS_NAMES[cls], s=15, alpha=0.25,
+                       edgecolors="none")
 
-    # Foreground: collision samples (refined diamond markers)
+    # Foreground: collision (diamond markers)
     for cls in sorted(CLASS_COLORS):
         m_cls = np.zeros(len(y_109), dtype=bool)
         for idx in dup_indices:
             if y_109[idx] == cls:
                 m_cls[idx] = True
         if m_cls.any():
-            ax.scatter(
-                emb[m_cls, 0], emb[m_cls, 1], c=CLASS_COLORS[cls],
-                s=55, alpha=1.0, edgecolors="black", linewidths=1.2,
-                zorder=10, marker="D",
-                label=f"{CLASS_NAMES[cls]} (collision)",
-            )
+            ax.scatter(emb_109[m_cls, 0], emb_109[m_cls, 1],
+                       c=CLASS_COLORS[cls], s=55, alpha=1.0,
+                       edgecolors="black", linewidths=1.2,
+                       zorder=10, marker="D",
+                       label=f"{CLASS_NAMES[cls]} (collision)")
 
-    # Connect collision pairs with dashed lines + annotations
     for a, b in pairs:
-        ax.plot(
-            [emb[a, 0], emb[b, 0]], [emb[a, 1], emb[b, 1]],
-            color="#333333", linewidth=1.0, linestyle="--", alpha=0.6, zorder=9,
-        )
-        la = CLASS_NAMES[y_109[a]]
-        lb = CLASS_NAMES[y_109[b]]
-        mid_x = (emb[a, 0] + emb[b, 0]) / 2
-        mid_y = (emb[a, 1] + emb[b, 1]) / 2
-        ax.annotate(
-            f"{la}/{lb}", (mid_x, mid_y),
-            fontsize=7, fontweight="bold", ha="center", va="bottom",
-            bbox=dict(
-                boxstyle="round,pad=0.2", fc="#FFFFDD",
-                ec="#999999", alpha=0.85, linewidth=0.6,
-            ),
-        )
+        ax.plot([emb_109[a, 0], emb_109[b, 0]],
+                [emb_109[a, 1], emb_109[b, 1]],
+                color="#333333", linewidth=1.0, linestyle="--",
+                alpha=0.6, zorder=9)
+        la, lb = CLASS_NAMES[y_109[a]], CLASS_NAMES[y_109[b]]
+        mid_x = (emb_109[a, 0] + emb_109[b, 0]) / 2
+        mid_y = (emb_109[a, 1] + emb_109[b, 1]) / 2
+        ax.annotate(f"{la}/{lb}", (mid_x, mid_y), fontsize=7,
+                    fontweight="bold", ha="center", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="#FFFFDD",
+                              ec="#999999", alpha=0.85, linewidth=0.6))
 
     ax.set_title(
         f"Timestamp Collision Analysis: {len(dup_indices)} events at "
         f"{len(pairs)} shared timestamps\n"
         "Collision pairs share identical sensor windows "
         "\u2192 overlapping embeddings, different labels",
-        fontsize=10, fontweight="bold",
-    )
+        fontsize=10, fontweight="bold")
     ax.set_xlabel("t-SNE 1")
     ax.set_ylabel("t-SNE 2")
-
-    # Legend below the plot to avoid occlusion
-    ax.legend(
-        fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.08),
-        ncol=3, frameon=True, framealpha=0.8,
-        edgecolor="#CCCCCC", markerscale=0.8, columnspacing=1.0,
-    )
+    ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.08),
+              ncol=3, frameon=True, framealpha=0.8,
+              edgecolor="#CCCCCC", markerscale=0.8, columnspacing=1.0)
     fig.subplots_adjust(bottom=0.15)
     save_fig(fig, output_dir, "fig2_collision_analysis")
 
 
 # ============================================================================
 # Figure 3: Classification Overlay (RF vs MLP)
+# Scenario: Compares RF and MLP[64]-d0.5 on the N=105 cleaned dataset
+#   using LOOCV. Both achieve 96.19% — the same 4 errors at the
+#   Enter/Leave boundary confirm the practical ceiling.
 # ============================================================================
 
-def fig3_classification_overlay(Z, y, y_pred_rf, y_pred_mlp, output_dir: Path):
+def fig3_classification_overlay(emb, y, y_pred_rf, y_pred_mlp,
+                                 output_dir: Path):
     """Side-by-side: RF vs MLP classification results on N=105."""
     setup_style()
-
-    # Use single shared t-SNE embedding for fair comparison
-    emb = tsne_2d(Z)
-
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
 
     for col, (name, y_pred) in enumerate([
@@ -463,112 +439,87 @@ def fig3_classification_overlay(Z, y, y_pred_rf, y_pred_mlp, output_dir: Path):
         correct = y == y_pred
         incorrect = ~correct
 
-        # Correct samples: colored by true class
         for cls in sorted(CLASS_COLORS):
             m = (y == cls) & correct
             if m.any():
-                ax.scatter(
-                    emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
-                    label=CLASS_NAMES[cls],
-                    s=22, alpha=0.6, edgecolors="white", linewidths=0.3,
-                )
+                ax.scatter(emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
+                           label=CLASS_NAMES[cls], s=22, alpha=0.6,
+                           edgecolors="white", linewidths=0.3)
 
-        # Misclassified samples: distinct red X markers
         if incorrect.any():
-            ax.scatter(
-                emb[incorrect, 0], emb[incorrect, 1],
-                c=ACCENT_RED,
-                s=40, alpha=0.95, edgecolors="#333333", linewidths=1.0,
-                marker="X", zorder=10, label="Misclassified",
-            )
-            # Annotate each error
+            ax.scatter(emb[incorrect, 0], emb[incorrect, 1], c=ACCENT_RED,
+                       s=40, alpha=0.95, edgecolors="#333333", linewidths=1.0,
+                       marker="X", zorder=10, label="Misclassified")
             for idx in np.where(incorrect)[0]:
-                true_cls = CLASS_NAMES[y[idx]]
-                pred_cls = CLASS_NAMES[y_pred[idx]]
                 ax.annotate(
-                    f"{true_cls}\u2192{pred_cls}",
-                    (emb[idx, 0], emb[idx, 1]),
-                    fontsize=6.5, fontweight="bold", ha="center", va="bottom",
+                    f"{CLASS_NAMES[y[idx]]}\u2192{CLASS_NAMES[y_pred[idx]]}",
+                    (emb[idx, 0], emb[idx, 1]), fontsize=6.5,
+                    fontweight="bold", ha="center", va="bottom",
                     xytext=(0, 7), textcoords="offset points",
-                    bbox=dict(
-                        boxstyle="round,pad=0.12", fc="white",
-                        ec="#444444", alpha=0.85, linewidth=0.6,
-                    ),
-                )
+                    bbox=dict(boxstyle="round,pad=0.12", fc="white",
+                              ec="#444444", alpha=0.85, linewidth=0.6))
 
         n_err = incorrect.sum()
         acc = 100 * correct.mean()
-        ax.set_title(
-            f"{name}\n"
-            f"Accuracy = {acc:.2f}%  "
-            f"({n_err} error{'s' if n_err != 1 else ''})",
-            fontsize=10, fontweight="bold",
-        )
+        ax.set_title(f"{name}\nAccuracy = {acc:.2f}%  "
+                     f"({n_err} error{'s' if n_err != 1 else ''})",
+                     fontsize=10, fontweight="bold")
         ax.set_xlabel("t-SNE 1")
         ax.set_ylabel("t-SNE 2")
-        ax.legend(
-            fontsize=7, loc="lower right", frameon=True, framealpha=0.7,
-            edgecolor="#CCCCCC", markerscale=0.9,
-        )
+        ax.legend(fontsize=7, loc="lower right", frameon=True,
+                  framealpha=0.7, edgecolor="#CCCCCC", markerscale=0.9)
 
     fig.suptitle(
         "N=105 Classification Results: sklearn RF vs Neural MLP\n"
         "(MantisV2 L3, M+C, 2+1+2 bidirectional, LOOCV)",
-        fontsize=12, fontweight="bold", y=1.03,
-    )
+        fontsize=12, fontweight="bold", y=1.03)
     fig.tight_layout()
     save_fig(fig, output_dir, "fig3_classification_overlay")
 
 
 # ============================================================================
 # Figure 4: Uncertainty Analysis
+# Scenario: Compares prediction uncertainty between RF and MLP via
+#   entropy heatmaps and confidence scatter. Reveals whether errors
+#   correlate with high uncertainty and if the two models disagree.
 # ============================================================================
 
-def fig4_uncertainty_analysis(
-    Z, y, y_prob_rf, y_prob_mlp, y_pred_rf, y_pred_mlp, output_dir: Path,
-):
+def fig4_uncertainty_analysis(emb, y, y_prob_rf, y_prob_mlp,
+                               y_pred_rf, y_pred_mlp, output_dir: Path):
     """4-panel uncertainty comparison: entropy maps + scatter + confidence."""
     setup_style()
 
     ent_rf = scipy_entropy(y_prob_rf, axis=1)
     ent_mlp = scipy_entropy(y_prob_mlp, axis=1)
-    max_ent = np.log(y_prob_rf.shape[1])  # log(n_classes)
-
-    emb = tsne_2d(Z)
+    max_ent = np.log(y_prob_rf.shape[1])
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 9.5))
 
-    # ---- (a) RF entropy heatmap on t-SNE ----
+    # (a) RF entropy heatmap
     ax = axes[0, 0]
-    sc = ax.scatter(
-        emb[:, 0], emb[:, 1], c=ent_rf, cmap="YlOrRd",
-        s=20, alpha=0.85, vmin=0, vmax=max_ent, edgecolors="white",
-        linewidths=0.15,
-    )
+    sc = ax.scatter(emb[:, 0], emb[:, 1], c=ent_rf, cmap="YlOrRd",
+                    s=20, alpha=0.85, vmin=0, vmax=max_ent,
+                    edgecolors="white", linewidths=0.15)
     cbar = fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02, aspect=25)
     cbar.set_label("Entropy", fontsize=8)
     cbar.ax.tick_params(labelsize=7)
     ax.set_title("(a) RF \u2014 Prediction Entropy", fontsize=10,
                  fontweight="bold")
-    ax.set_xlabel("t-SNE 1")
-    ax.set_ylabel("t-SNE 2")
+    ax.set_xlabel("t-SNE 1"); ax.set_ylabel("t-SNE 2")
 
-    # ---- (b) MLP entropy heatmap on t-SNE ----
+    # (b) MLP entropy heatmap
     ax = axes[0, 1]
-    sc = ax.scatter(
-        emb[:, 0], emb[:, 1], c=ent_mlp, cmap="YlOrRd",
-        s=20, alpha=0.85, vmin=0, vmax=max_ent, edgecolors="white",
-        linewidths=0.15,
-    )
+    sc = ax.scatter(emb[:, 0], emb[:, 1], c=ent_mlp, cmap="YlOrRd",
+                    s=20, alpha=0.85, vmin=0, vmax=max_ent,
+                    edgecolors="white", linewidths=0.15)
     cbar = fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02, aspect=25)
     cbar.set_label("Entropy", fontsize=8)
     cbar.ax.tick_params(labelsize=7)
     ax.set_title("(b) MLP \u2014 Prediction Entropy", fontsize=10,
                  fontweight="bold")
-    ax.set_xlabel("t-SNE 1")
-    ax.set_ylabel("t-SNE 2")
+    ax.set_xlabel("t-SNE 1"); ax.set_ylabel("t-SNE 2")
 
-    # ---- (c) RF vs MLP entropy scatter ----
+    # (c) RF vs MLP entropy scatter
     ax = axes[1, 0]
     correct_both = (y == y_pred_rf) & (y == y_pred_mlp)
     wrong_both = (y != y_pred_rf) & (y != y_pred_mlp)
@@ -576,43 +527,30 @@ def fig4_uncertainty_analysis(
     mlp_only_wrong = (y == y_pred_rf) & (y != y_pred_mlp)
 
     if correct_both.any():
-        ax.scatter(
-            ent_rf[correct_both], ent_mlp[correct_both],
-            c="#BBBBBB", s=12, alpha=0.35, label="Both correct",
-        )
+        ax.scatter(ent_rf[correct_both], ent_mlp[correct_both],
+                   c="#BBBBBB", s=12, alpha=0.35, label="Both correct")
     if wrong_both.any():
-        ax.scatter(
-            ent_rf[wrong_both], ent_mlp[wrong_both],
-            c=ACCENT_RED, s=35, alpha=1.0, marker="X",
-            edgecolors="#333333", linewidths=0.7,
-            label="Both wrong", zorder=10,
-        )
+        ax.scatter(ent_rf[wrong_both], ent_mlp[wrong_both], c=ACCENT_RED,
+                   s=35, alpha=1.0, marker="X", edgecolors="#333333",
+                   linewidths=0.7, label="Both wrong", zorder=10)
     if rf_only_wrong.any():
-        ax.scatter(
-            ent_rf[rf_only_wrong], ent_mlp[rf_only_wrong],
-            c="#1f77b4", s=28, alpha=0.9, marker="s",
-            edgecolors="#333333", linewidths=0.4,
-            label="RF wrong only", zorder=9,
-        )
+        ax.scatter(ent_rf[rf_only_wrong], ent_mlp[rf_only_wrong],
+                   c="#1f77b4", s=28, alpha=0.9, marker="s",
+                   edgecolors="#333333", linewidths=0.4,
+                   label="RF wrong only", zorder=9)
     if mlp_only_wrong.any():
-        ax.scatter(
-            ent_rf[mlp_only_wrong], ent_mlp[mlp_only_wrong],
-            c="#ff7f0e", s=28, alpha=0.9, marker="^",
-            edgecolors="#333333", linewidths=0.4,
-            label="MLP wrong only", zorder=9,
-        )
+        ax.scatter(ent_rf[mlp_only_wrong], ent_mlp[mlp_only_wrong],
+                   c="#ff7f0e", s=28, alpha=0.9, marker="^",
+                   edgecolors="#333333", linewidths=0.4,
+                   label="MLP wrong only", zorder=9)
     ax.plot([0, max_ent], [0, max_ent], "k--", alpha=0.2, linewidth=0.8)
-    ax.set_xlabel("RF Entropy")
-    ax.set_ylabel("MLP Entropy")
-    ax.set_title(
-        "(c) Per-Sample Entropy: RF vs MLP", fontsize=10, fontweight="bold",
-    )
-    ax.legend(
-        fontsize=7, frameon=True, framealpha=0.7, edgecolor="#CCCCCC",
-        loc="lower right", markerscale=0.9,
-    )
+    ax.set_xlabel("RF Entropy"); ax.set_ylabel("MLP Entropy")
+    ax.set_title("(c) Per-Sample Entropy: RF vs MLP", fontsize=10,
+                 fontweight="bold")
+    ax.legend(fontsize=7, frameon=True, framealpha=0.7, edgecolor="#CCCCCC",
+              loc="lower right", markerscale=0.9)
 
-    # ---- (d) Confidence (max prob) comparison ----
+    # (d) Confidence scatter
     ax = axes[1, 1]
     conf_rf = y_prob_rf.max(axis=1)
     conf_mlp = y_prob_mlp.max(axis=1)
@@ -620,30 +558,214 @@ def fig4_uncertainty_analysis(
     ax.scatter(conf_rf, conf_mlp, c=colors, s=15, alpha=0.55,
                edgecolors="white", linewidths=0.15)
     ax.plot([0.3, 1], [0.3, 1], "k--", alpha=0.2, linewidth=0.8)
-    ax.set_xlabel("RF Max Probability")
-    ax.set_ylabel("MLP Max Probability")
+    ax.set_xlabel("RF Max Probability"); ax.set_ylabel("MLP Max Probability")
     ax.set_title("(d) Prediction Confidence", fontsize=10, fontweight="bold")
-    ax.set_xlim(0.25, 1.03)
-    ax.set_ylim(0.25, 1.03)
+    ax.set_xlim(0.25, 1.03); ax.set_ylim(0.25, 1.03)
     legend_elems = [
         Line2D([0], [0], marker="o", color="w", markerfacecolor=ACCENT_GREEN,
                markersize=5.5, label="Correct"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor=ACCENT_RED,
                markersize=5.5, label="Incorrect"),
     ]
-    ax.legend(
-        handles=legend_elems, fontsize=7,
-        frameon=True, framealpha=0.7, edgecolor="#CCCCCC",
-        loc="lower right",
-    )
+    ax.legend(handles=legend_elems, fontsize=7, frameon=True, framealpha=0.7,
+              edgecolor="#CCCCCC", loc="lower right")
 
-    fig.suptitle(
-        "Uncertainty & Confidence Analysis: RF vs MLP "
-        "(N=105, L3, M+C, 2+1+2)",
-        fontsize=12, fontweight="bold", y=1.01,
-    )
+    fig.suptitle("Uncertainty & Confidence Analysis: RF vs MLP "
+                 "(N=105, L3, M+C, 2+1+2)",
+                 fontsize=12, fontweight="bold", y=1.01)
     fig.subplots_adjust(hspace=0.28, wspace=0.28)
     save_fig(fig, output_dir, "fig4_uncertainty_analysis")
+
+
+# ============================================================================
+# Figure 5: Layer Ablation (2x3 grid)
+# Scenario: Which transformer layer produces the best class separation?
+#   Early layers (L0-L1) capture low-level temporal patterns; deeper
+#   layers (L3-L5) form higher-level abstractions. L3 was identified
+#   as optimal in the Phase 1 sweep.
+# ============================================================================
+
+def fig5_layer_ablation(pretrained, output_token, device,
+                        sensor_arr, sensor_ts, event_ts, event_labels,
+                        ctx_before, ctx_after, seed, output_dir: Path):
+    """2x3 grid: t-SNE from each transformer layer L0-L5."""
+    setup_style()
+    layers = [0, 1, 2, 3, 4, 5]
+    default_layer = 3
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+
+    for i, layer in enumerate(layers):
+        ax = axes[i // 3, i % 3]
+        logger.info("  Fig5 L%d: loading model + extracting...", layer)
+        model = load_mantis(pretrained, layer=layer,
+                            output_token=output_token, device=device)
+        Z, y = extract_embeddings(model, sensor_arr, sensor_ts, event_ts,
+                                   event_labels, ctx_before=ctx_before,
+                                   ctx_after=ctx_after)
+        del model; gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        emb = tsne_2d(Z, seed=seed)
+        for cls in sorted(CLASS_COLORS):
+            m = y == cls
+            if m.any():
+                ax.scatter(emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
+                           s=22, alpha=0.65, edgecolors="white",
+                           linewidths=0.2)
+
+        tag = " *" if layer == default_layer else ""
+        ax.set_title(f"L{layer}{tag}", fontsize=10, fontweight="bold")
+        ax.set_xlabel("t-SNE 1", fontsize=8)
+        ax.set_ylabel("t-SNE 2", fontsize=8)
+
+    handles = [Line2D([0], [0], marker="o", color="w",
+                      markerfacecolor=CLASS_COLORS[c], markersize=6,
+                      label=CLASS_NAMES[c])
+               for c in sorted(CLASS_COLORS)]
+    fig.legend(handles=handles, loc="lower center",
+               ncol=len(CLASS_COLORS), fontsize=8, frameon=True,
+               framealpha=0.7, bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle(
+        "Layer Ablation: Embedding Quality Across L0\u2013L5\n"
+        f"(MantisV2, M+C, {ctx_before}+1+{ctx_after} bidirectional, "
+        "N=105, * = optimal)",
+        fontsize=12, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.06)
+    save_fig(fig, output_dir, "fig5_layer_ablation")
+
+
+# ============================================================================
+# Figure 6: Context Window Ablation (2x3 grid)
+# Scenario: How does the size of the temporal context window affect class
+#   separation? Enter/Leave events are highly localized — the optimal
+#   window is 2+1+2 (5 min). Larger windows add noise from unrelated
+#   sensor activity.
+# ============================================================================
+
+def fig6_context_ablation(model, sensor_arr, sensor_ts, event_ts,
+                           event_labels, seed, output_dir: Path):
+    """2x3 grid: t-SNE with varying context windows."""
+    setup_style()
+    contexts = [
+        (1, 1, "1+1+1 (3 min)"),
+        (2, 2, "2+1+2 (5 min) *"),
+        (4, 4, "4+1+4 (9 min)"),
+        (10, 10, "10+1+10 (21 min)"),
+        (20, 20, "20+1+20 (41 min)"),
+        (4, 0, "4+1+0 (backward)"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+
+    for i, (cb, ca, label) in enumerate(contexts):
+        ax = axes[i // 3, i % 3]
+        logger.info("  Fig6 context %s: extracting...", label)
+        Z, y = extract_embeddings(model, sensor_arr, sensor_ts, event_ts,
+                                   event_labels, ctx_before=cb, ctx_after=ca)
+        emb = tsne_2d(Z, seed=seed)
+
+        for cls in sorted(CLASS_COLORS):
+            m = y == cls
+            if m.any():
+                ax.scatter(emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
+                           s=22, alpha=0.65, edgecolors="white",
+                           linewidths=0.2)
+
+        ax.set_title(label, fontsize=10, fontweight="bold")
+        ax.set_xlabel("t-SNE 1", fontsize=8)
+        ax.set_ylabel("t-SNE 2", fontsize=8)
+
+    handles = [Line2D([0], [0], marker="o", color="w",
+                      markerfacecolor=CLASS_COLORS[c], markersize=6,
+                      label=CLASS_NAMES[c])
+               for c in sorted(CLASS_COLORS)]
+    fig.legend(handles=handles, loc="lower center",
+               ncol=len(CLASS_COLORS), fontsize=8, frameon=True,
+               framealpha=0.7, bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle(
+        "Context Window Ablation: Temporal Scope vs Class Separation\n"
+        "(MantisV2 L3, M+C, N=105, * = optimal)",
+        fontsize=12, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.06)
+    save_fig(fig, output_dir, "fig6_context_ablation")
+
+
+# ============================================================================
+# Figure 7: Channel Ablation (2x3 grid)
+# Scenario: Which sensor channels contribute most to class separation?
+#   M (motion) and C (contact) are the two primary channels. T1
+#   (temperature) adds marginal value. The optimal combo is M+C.
+# ============================================================================
+
+def fig7_channel_ablation(raw_cfg, model, ctx_before, ctx_after,
+                           seed, output_dir: Path):
+    """2x3 grid: t-SNE with different channel combinations."""
+    setup_style()
+    combos = [
+        ("M only", ["d620900d_motionSensor"]),
+        ("C only", ["408981c2_contactSensor"]),
+        ("T1 only", ["d620900d_temperatureMeasurement"]),
+        ("M+C *", ["d620900d_motionSensor", "408981c2_contactSensor"]),
+        ("M+C+T1", ["d620900d_motionSensor", "408981c2_contactSensor",
+                     "d620900d_temperatureMeasurement"]),
+        ("All 6ch", None),  # None = use all from config
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+
+    for i, (name, channels) in enumerate(combos):
+        ax = axes[i // 3, i % 3]
+        logger.info("  Fig7 %s: loading data + extracting...", name)
+
+        cfg_ch = copy.deepcopy(raw_cfg)
+        if channels is not None:
+            cfg_ch["data"]["channels"] = channels
+        try:
+            sensor_arr, sensor_ts, event_ts, labels, ch_names, _ = \
+                load_data(cfg_ch, include_none=True)
+            Z, y = extract_embeddings(model, sensor_arr, sensor_ts, event_ts,
+                                       labels, ctx_before=ctx_before,
+                                       ctx_after=ctx_after)
+            emb = tsne_2d(Z, seed=seed)
+            n_ch = len(ch_names)
+            embed_d = Z.shape[1]
+
+            for cls in sorted(CLASS_COLORS):
+                m = y == cls
+                if m.any():
+                    ax.scatter(emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
+                               s=22, alpha=0.65, edgecolors="white",
+                               linewidths=0.2)
+            ax.set_title(f"{name}\n({n_ch}ch, {embed_d}-d)", fontsize=9,
+                         fontweight="bold")
+        except Exception as e:
+            logger.warning("  Fig7 %s failed: %s", name, e)
+            ax.set_title(f"{name}\n(unavailable)", fontsize=9)
+            ax.text(0.5, 0.5, "N/A", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=14, color="#999999")
+
+        ax.set_xlabel("t-SNE 1", fontsize=8)
+        ax.set_ylabel("t-SNE 2", fontsize=8)
+
+    handles = [Line2D([0], [0], marker="o", color="w",
+                      markerfacecolor=CLASS_COLORS[c], markersize=6,
+                      label=CLASS_NAMES[c])
+               for c in sorted(CLASS_COLORS)]
+    fig.legend(handles=handles, loc="lower center",
+               ncol=len(CLASS_COLORS), fontsize=8, frameon=True,
+               framealpha=0.7, bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle(
+        "Channel Ablation: Sensor Contribution to Class Separation\n"
+        f"(MantisV2 L3, {ctx_before}+1+{ctx_after} bidirectional, "
+        "N=105, * = optimal)",
+        fontsize=12, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.06)
+    save_fig(fig, output_dir, "fig7_channel_ablation")
 
 
 # ============================================================================
@@ -660,6 +782,8 @@ def main():
     parser.add_argument("--output-dir", type=str,
                         default="results/visualization_analysis")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--figures", type=int, nargs="*", default=None,
+                        help="Figure numbers to generate (default: all 1-7)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -668,6 +792,7 @@ def main():
     )
     setup_style()
 
+    figs_to_run = set(args.figures) if args.figures else set(range(1, 8))
     output_dir = Path(args.output_dir)
     raw_cfg = load_config(args.config)
     device = args.device
@@ -677,18 +802,15 @@ def main():
 
     # Data paths
     data_cfg = raw_cfg.get("data", {})
-    events_csv_cleaned = data_cfg.get("events_csv", "")  # N=105
-    events_csv_original = events_csv_cleaned.replace(
-        "_with_none_cleaned", "",
-    )
+    events_csv_cleaned = data_cfg.get("events_csv", "")
+    events_csv_original = events_csv_cleaned.replace("_with_none_cleaned", "")
     if events_csv_original == events_csv_cleaned:
         events_csv_original = events_csv_cleaned.replace("_cleaned", "")
 
-    # Restrict to M+C (optimal 2 channels)
+    # M+C config (optimal channels)
     cfg_mc = copy.deepcopy(raw_cfg)
     cfg_mc["data"]["channels"] = [
-        "d620900d_motionSensor",
-        "408981c2_contactSensor",
+        "d620900d_motionSensor", "408981c2_contactSensor",
     ]
 
     t0 = time.time()
@@ -700,24 +822,23 @@ def main():
                         device=device)
 
     # ==== Load N=109 data (with collisions) ====
-    logger.info("Loading N=109 data (with collisions)...")
-    has_109 = True
-    try:
-        (sensor_arr, sensor_ts, event_ts_109, labels_109,
-         ch_names, cls_names) = load_data(
-            cfg_mc, include_none=True,
-            events_csv_override=events_csv_original,
-        )
-        logger.info("N=109: %d events, %d channels",
-                     len(labels_109), len(ch_names))
-    except Exception as e:
-        logger.warning("Could not load N=109 data (%s). Skipping Fig 1-2.", e)
-        has_109 = False
+    has_109 = bool({1, 2} & figs_to_run)
+    if has_109:
+        logger.info("Loading N=109 data (with collisions)...")
+        try:
+            (sensor_arr_109, sensor_ts_109, event_ts_109, labels_109,
+             ch_names_109, _) = load_data(
+                cfg_mc, include_none=True,
+                events_csv_override=events_csv_original)
+            logger.info("N=109: %d events", len(labels_109))
+        except Exception as e:
+            logger.warning("Could not load N=109 data (%s). Skipping.", e)
+            has_109 = False
 
-    # ==== Load N=105 data (cleaned) ====
+    # ==== Load N=105 data (cleaned, M+C) ====
     logger.info("Loading N=105 data (cleaned)...")
     (sensor_arr_105, sensor_ts_105, event_ts_105, labels_105,
-     ch_names_105, cls_names_105) = load_data(cfg_mc, include_none=True)
+     ch_names_105, _) = load_data(cfg_mc, include_none=True)
     logger.info("N=105: %d events, %d channels",
                  len(labels_105), len(ch_names_105))
 
@@ -726,8 +847,7 @@ def main():
     logger.info("Extracting L3 embeddings for N=105 (M+C, 2+1+2)...")
     Z_105, y_105 = extract_embeddings(
         model, sensor_arr_105, sensor_ts_105, event_ts_105, labels_105,
-        ctx_before=2, ctx_after=2,
-    )
+        ctx_before=2, ctx_after=2)
     embed_dim = Z_105.shape[1]
     logger.info("N=105 embeddings: shape=%s (dim=%d)", Z_105.shape, embed_dim)
 
@@ -735,57 +855,91 @@ def main():
     if has_109:
         logger.info("Extracting L3 embeddings for N=109...")
         Z_109, y_109 = extract_embeddings(
-            model, sensor_arr, sensor_ts, event_ts_109, labels_109,
-            ctx_before=2, ctx_after=2,
-        )
-        logger.info("N=109 embeddings: shape=%s", Z_109.shape)
+            model, sensor_arr_109, sensor_ts_109, event_ts_109, labels_109,
+            ctx_before=2, ctx_after=2)
+
+    # ==== Pre-compute t-SNE ONCE per dataset (consistency across figures) ====
+    logger.info("=" * 60)
+    logger.info("Pre-computing t-SNE (once per dataset, reused by all figs)...")
+    emb_105 = tsne_2d(Z_105, seed=args.seed)
+    emb_109 = None
+    if has_109:
+        emb_109 = tsne_2d(Z_109, seed=args.seed)
+
+    # ==== Collision detection ====
+    pairs, dup_indices = [], np.array([], dtype=int)
+    if has_109:
+        pairs, dup_indices = detect_collision_pairs(event_ts_109, y_109)
 
     # ==== Fig 1: N=109 vs N=105 ====
-    if has_109:
-        logger.info("=" * 60)
+    if 1 in figs_to_run and has_109:
         logger.info("Fig 1: N=109 vs N=105 t-SNE comparison...")
-        fig1_n109_vs_n105(Z_109, y_109, Z_105, y_105, output_dir)
+        fig1_n109_vs_n105(emb_109, y_109, emb_105, y_105, output_dir)
 
     # ==== Fig 2: Collision analysis ====
-    if has_109:
+    if 2 in figs_to_run and has_109:
         logger.info("Fig 2: Collision sample analysis...")
-        fig2_collision_analysis(Z_109, y_109, event_ts_109, output_dir)
+        fig2_collision_analysis(emb_109, y_109, pairs, dup_indices, output_dir)
 
-    # ==== Run LOOCV (RF + MLP) ====
-    logger.info("=" * 60)
-    logger.info("Running RF LOOCV on N=105...")
-    y_pred_rf, y_prob_rf = run_rf_loocv(Z_105, y_105, seed=args.seed)
-    acc_rf = 100 * (y_105 == y_pred_rf).mean()
-    logger.info("RF: %.2f%% (%d/%d correct)",
-                 acc_rf, (y_105 == y_pred_rf).sum(), len(y_105))
+    # ==== Run LOOCV (RF + MLP) for Fig 3-4 ====
+    y_pred_rf = y_prob_rf = y_pred_mlp = y_prob_mlp = None
+    if {3, 4} & figs_to_run:
+        logger.info("=" * 60)
+        logger.info("Running RF LOOCV on N=105...")
+        y_pred_rf, y_prob_rf = run_rf_loocv(Z_105, y_105, seed=args.seed)
+        acc_rf = 100 * (y_105 == y_pred_rf).mean()
+        logger.info("RF: %.2f%% (%d/%d correct)",
+                     acc_rf, (y_105 == y_pred_rf).sum(), len(y_105))
 
-    logger.info("Running MLP LOOCV on N=105 (this takes ~30-60s)...")
-    y_pred_mlp, y_prob_mlp = run_mlp_loocv(
-        Z_105, y_105, embed_dim, device=device, seed=args.seed,
-    )
-    acc_mlp = 100 * (y_105 == y_pred_mlp).mean()
-    logger.info("MLP: %.2f%% (%d/%d correct)",
-                 acc_mlp, (y_105 == y_pred_mlp).sum(), len(y_105))
+        logger.info("Running MLP LOOCV on N=105 (~30-60s)...")
+        y_pred_mlp, y_prob_mlp = run_mlp_loocv(
+            Z_105, y_105, embed_dim, device=device, seed=args.seed)
+        acc_mlp = 100 * (y_105 == y_pred_mlp).mean()
+        logger.info("MLP: %.2f%% (%d/%d correct)",
+                     acc_mlp, (y_105 == y_pred_mlp).sum(), len(y_105))
 
     # ==== Fig 3: Classification overlay ====
-    logger.info("Fig 3: Classification overlay (RF vs MLP)...")
-    fig3_classification_overlay(Z_105, y_105, y_pred_rf, y_pred_mlp,
-                                 output_dir)
+    if 3 in figs_to_run:
+        logger.info("Fig 3: Classification overlay (RF vs MLP)...")
+        fig3_classification_overlay(emb_105, y_105, y_pred_rf, y_pred_mlp,
+                                     output_dir)
 
     # ==== Fig 4: Uncertainty analysis ====
-    logger.info("Fig 4: Uncertainty analysis...")
-    fig4_uncertainty_analysis(Z_105, y_105, y_prob_rf, y_prob_mlp,
-                               y_pred_rf, y_pred_mlp, output_dir)
+    if 4 in figs_to_run:
+        logger.info("Fig 4: Uncertainty analysis...")
+        fig4_uncertainty_analysis(emb_105, y_105, y_prob_rf, y_prob_mlp,
+                                   y_pred_rf, y_pred_mlp, output_dir)
+
+    # ==== Fig 5: Layer ablation ====
+    if 5 in figs_to_run:
+        logger.info("=" * 60)
+        logger.info("Fig 5: Layer ablation (L0-L5)...")
+        fig5_layer_ablation(pretrained, output_token, device,
+                            sensor_arr_105, sensor_ts_105, event_ts_105,
+                            labels_105, 2, 2, args.seed, output_dir)
+
+    # ==== Fig 6: Context window ablation ====
+    if 6 in figs_to_run:
+        logger.info("=" * 60)
+        logger.info("Fig 6: Context window ablation...")
+        fig6_context_ablation(model, sensor_arr_105, sensor_ts_105,
+                               event_ts_105, labels_105, args.seed,
+                               output_dir)
+
+    # ==== Fig 7: Channel ablation ====
+    if 7 in figs_to_run:
+        logger.info("=" * 60)
+        logger.info("Fig 7: Channel ablation...")
+        fig7_channel_ablation(raw_cfg, model, 2, 2, args.seed, output_dir)
 
     elapsed = time.time() - t0
     logger.info("=" * 60)
     logger.info("All figures saved to: %s", output_dir.resolve())
     logger.info("Total time: %.1fs", elapsed)
-    logger.info(
-        "Summary -- RF: %.2f%% (%d errors) | MLP: %.2f%% (%d errors)",
-        acc_rf, (y_105 != y_pred_rf).sum(),
-        acc_mlp, (y_105 != y_pred_mlp).sum(),
-    )
+    if y_pred_rf is not None:
+        logger.info("Summary -- RF: %.2f%% | MLP: %.2f%%",
+                     100 * (y_105 == y_pred_rf).mean(),
+                     100 * (y_105 == y_pred_mlp).mean())
 
 
 if __name__ == "__main__":
