@@ -1,55 +1,77 @@
 #!/usr/bin/env python3
-"""Phase 2 Comprehensive Sweep: MantisV2 Frozen Embeddings + Neural Classification Heads.
+"""Phase 2 Comprehensive Sweep: Neural Classification Heads on MantisV2 Frozen Embeddings.
 
-Trains lightweight neural classification heads on pre-extracted MantisV2
-embeddings to beat the Phase 1 sklearn baseline.
+Updated with Phase 1.5 optimal defaults (SVM baseline to beat):
+  - M+C+T1 channels (3ch) -> AUC=0.9859
+  - 251min bidirectional context (125+1+125)
+  - L2 layer (best single layer)
+  - SVM_rbf AUC=0.9859, EER=0.0470, Acc=0.9509
 
-Designed for 3 parallel GPU servers to find optimal configuration.
+Six sweep groups (run independently on 6 parallel GPU servers):
 
-Three sweep groups (run independently on separate GPUs):
-
-  Group A — Augmentation × Head Architecture (48 experiments)
-    - 8 augmentation strategies × 6 head architectures
-    - Fixed: best context/layer/channels from Phase 1
+  Group D -- Augmentation x Head Architecture (120 experiments)
+    - 10 augmentation strategies x 12 head architectures
+    - Fixed: M+C+T1, 251min, L2
     - Goal: Find best augmentation + head combination
 
-  Group B — Layer Selection & Fusion (30 experiments)
-    - 6 single layers + 10 concat combos + 5 fusion configs
-    + 9 attention-pool configs = 30 experiments
-    - Fixed: best augmentation from Group A
-    - Goal: Find optimal layer utilization strategy
+  Group E -- Context Window Exploration (96 experiments)
+    - 12 context sizes x 2 channel configs x 4 classifiers
+    - Requires re-extraction per context window
+    - Goal: Confirm optimal context window for neural heads
 
-  Group C — Training Hyperparameters + TTA + Ensemble (42 experiments)
-    - 6 LR × 3 weight_decay + 6 TTA configs + 6 ensemble configs
-    + 3 label smoothing + 6 epoch/patience combos = 42 experiments
-    - Fixed: best choices from Groups A & B
-    - Goal: Fine-tune training + inference-time ensembling
+  Group F -- Layer x Fusion Strategy (80 experiments)
+    - 6 single layers x 4 heads + concat + fusion + attention
+    - Fixed: M+C+T1, 251min
+    - Goal: Optimal layer utilization strategy
+
+  Group G -- Training Hyperparameters (90 experiments)
+    - LR x WD grid + optimizer/scheduler + label smoothing + epoch/patience
+    - Fixed: best defaults
+    - Goal: Fine-tune training recipe
+
+  Group H -- Augmentation Deep Dive (70 experiments)
+    - DC/SMOTE/FroFA/AdaptNoise/Mixup param grids + combined strategies
+    - Goal: Systematic augmentation optimization
+
+  Group I -- TTA + Ensemble + Final (68 experiments)
+    - TTA sweep + multi-seed ensemble + hybrid + sklearn baseline
+    - Goal: Inference-time boosting + final comparison vs SVM
+
+Total: ~524 experiments across 6 servers.
 
 Usage:
   cd examples/classification/apc_occupancy
 
-  # Run all groups sequentially
+  # Run specific group (one per GPU server)
+  python training/run_phase2_sweep.py \\
+      --config training/configs/occupancy-phase2.yaml --group D --device cuda
+  python training/run_phase2_sweep.py \\
+      --config training/configs/occupancy-phase2.yaml --group E --device cuda
+  python training/run_phase2_sweep.py \\
+      --config training/configs/occupancy-phase2.yaml --group F --device cuda
+  python training/run_phase2_sweep.py \\
+      --config training/configs/occupancy-phase2.yaml --group G --device cuda
+  python training/run_phase2_sweep.py \\
+      --config training/configs/occupancy-phase2.yaml --group H --device cuda
+  python training/run_phase2_sweep.py \\
+      --config training/configs/occupancy-phase2.yaml --group I --device cuda
+
+  # Run all groups sequentially (single server, ~3-6h)
   python training/run_phase2_sweep.py \\
       --config training/configs/occupancy-phase2.yaml --device cuda
-
-  # Run single group (for parallel GPU servers)
-  python training/run_phase2_sweep.py \\
-      --config training/configs/occupancy-phase2.yaml --group A --device cuda
-  python training/run_phase2_sweep.py \\
-      --config training/configs/occupancy-phase2.yaml --group B --device cuda
-  python training/run_phase2_sweep.py \\
-      --config training/configs/occupancy-phase2.yaml --group C --device cuda
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
+import math
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -63,11 +85,11 @@ if not os.environ.get("DISPLAY"):
     mpl.use("Agg")
 import matplotlib.pyplot as plt
 
-# Local imports — run from apc_occupancy/ directory
+# Local imports -- run from apc_occupancy/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data.preprocess import PreprocessConfig, load_occupancy_data
-from data.dataset import DatasetConfig, OccupancyDataset, build_dataset_config
+from data.dataset import DatasetConfig, OccupancyDataset
 from evaluation.metrics import compute_metrics, compute_wilson_ci, ClassificationMetrics
 from training.heads import build_head
 from training.augmentation import (
@@ -78,20 +100,37 @@ from visualization.style import (
     setup_style,
     save_figure,
     configure_output,
-    CLASS_COLORS,
-    CLASS_NAMES,
-    FIGSIZE_SINGLE,
 )
-from visualization.curves import plot_confusion_matrix
-from visualization.embeddings import reduce_dimensions
 
 logger = logging.getLogger(__name__)
 
 ALL_LAYERS = [0, 1, 2, 3, 4, 5]
 
+# ============================================================================
+# Channel Map (verified available channels from Phase 1.5)
+# ============================================================================
+
+CHANNEL_MAP = {
+    "M": "d620900d_motionSensor",
+    "C": "408981c2_contactSensor",
+    "T1": "d620900d_temperatureMeasurement",
+    "T2": "ccea734e_temperatureMeasurement",
+    "P": "f2e891c6_powerMeter",
+}
+
+
+def _resolve_channels(keys: list[str]) -> list[str]:
+    """Convert short keys (M, C, T1, ...) to full channel names."""
+    return [CHANNEL_MAP[k] for k in keys]
+
+
+def _ch_label(keys: list[str]) -> str:
+    """Generate human-readable channel label from keys."""
+    return "+".join(keys)
+
 
 # ============================================================================
-# Training config
+# Training config (extended for Phase 2)
 # ============================================================================
 
 @dataclass
@@ -104,10 +143,15 @@ class TrainConfig:
     early_stopping_patience: int = 30
     augmentation: dict | None = None
     device: str = "cpu"
+    # Phase 2 extensions
+    optimizer: str = "adamw"       # adamw, adam, sgd, rmsprop
+    scheduler: str = "cosine"      # cosine, step, onecycle, plateau, none
+    grad_clip: float = 0.0         # 0 = disabled
+    class_weight: list[float] | None = None
 
 
 # ============================================================================
-# Model + Embedding utilities (shared with Phase 1)
+# Model + Embedding utilities
 # ============================================================================
 
 def load_mantis_model(pretrained_name: str, layer: int, output_token: str, device: str):
@@ -132,7 +176,7 @@ def load_mantis_model(pretrained_name: str, layer: int, output_token: str, devic
 def extract_embeddings(model, dataset: OccupancyDataset, device: str) -> np.ndarray:
     """Extract frozen embeddings for all windows in the dataset.
 
-    Returns shape (n_windows, embed_dim).
+    Returns shape (n_windows, n_channels * embed_dim).
     """
     X, _ = dataset.get_numpy_arrays()  # (N, C, L)
     n_samples, n_channels, seq_len = X.shape
@@ -155,19 +199,8 @@ def extract_embeddings(model, dataset: OccupancyDataset, device: str) -> np.ndar
     return Z
 
 
-def _extract_prob_positive(head: nn.Module, Z_test: torch.Tensor, device: str) -> np.ndarray:
-    """Extract P(class=1) from neural head."""
-    head.eval()
-    with torch.no_grad():
-        logits = head(Z_test.to(device))
-        probs = torch.softmax(logits, dim=1).cpu().numpy()
-    if probs.shape[1] >= 2:
-        return probs[:, 1]
-    return probs[:, 0]
-
-
 # ============================================================================
-# Neural training loop
+# Neural training loop (extended)
 # ============================================================================
 
 def train_head(
@@ -180,7 +213,7 @@ def train_head(
 ) -> nn.Module:
     """Train a classification head on embedding data.
 
-    Full-batch training with AdamW + CosineAnnealingLR.
+    Full-batch training with configurable optimizer + scheduler.
     """
     device = torch.device(config.device)
     head = head.to(device)
@@ -191,12 +224,32 @@ def train_head(
     if Z_train_std is not None:
         Z_train_std = Z_train_std.to(device)
 
-    optimizer = torch.optim.AdamW(
-        head.parameters(), lr=config.lr, weight_decay=config.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.epochs,
-    )
+    # Optimizer selection
+    params = head.parameters()
+    if config.optimizer == "adam":
+        optimizer = torch.optim.Adam(params, lr=config.lr, weight_decay=config.weight_decay)
+    elif config.optimizer == "sgd":
+        optimizer = torch.optim.SGD(params, lr=config.lr, weight_decay=config.weight_decay, momentum=0.9)
+    elif config.optimizer == "rmsprop":
+        optimizer = torch.optim.RMSprop(params, lr=config.lr, weight_decay=config.weight_decay)
+    else:  # adamw (default)
+        optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+
+    # Scheduler selection
+    if config.scheduler == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    elif config.scheduler == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=config.lr, total_steps=config.epochs,
+        )
+    elif config.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, patience=10, factor=0.5,
+        )
+    elif config.scheduler == "none":
+        scheduler = None
+    else:  # cosine (default)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
 
     # Loss function
     aug_cfg = config.augmentation or {}
@@ -211,7 +264,12 @@ def train_head(
             log_probs = torch.nn.functional.log_softmax(logits, dim=1)
             return -(targets * log_probs).sum(dim=1).mean()
     else:
-        loss_fn = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
+        weight = None
+        if config.class_weight is not None:
+            weight = torch.tensor(config.class_weight, dtype=torch.float32, device=device)
+        loss_fn = nn.CrossEntropyLoss(
+            weight=weight, label_smoothing=config.label_smoothing,
+        )
 
     best_loss = float("inf")
     patience_counter = 0
@@ -230,8 +288,17 @@ def train_head(
 
         optimizer.zero_grad()
         loss.backward()
+
+        if config.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(head.parameters(), config.grad_clip)
+
         optimizer.step()
-        scheduler.step()
+
+        if scheduler is not None:
+            if config.scheduler == "plateau":
+                scheduler.step(loss.item())
+            else:
+                scheduler.step()
 
         loss_val = loss.item()
 
@@ -251,7 +318,7 @@ def train_head(
 
 
 # ============================================================================
-# Train/test evaluation (occupancy-specific: date-based split)
+# Train/test evaluation functions
 # ============================================================================
 
 def run_neural_train_test(
@@ -265,15 +332,7 @@ def run_neural_train_test(
     epoch_aug_config: dict | None = None,
     seed: int = 42,
 ) -> tuple[ClassificationMetrics, np.ndarray, np.ndarray]:
-    """Train neural head and evaluate on test set.
-
-    Supports both pre-training augmentation (DC/SMOTE on numpy)
-    and per-epoch augmentation (FroFA/noise on tensors).
-
-    Returns
-    -------
-    tuple of (metrics, y_pred, y_prob)
-    """
+    """Train neural head and evaluate on test set."""
     from sklearn.preprocessing import StandardScaler
 
     rng = np.random.default_rng(seed)
@@ -309,6 +368,10 @@ def run_neural_train_test(
         early_stopping_patience=train_config.early_stopping_patience,
         augmentation=epoch_aug_config,
         device=train_config.device,
+        optimizer=train_config.optimizer,
+        scheduler=train_config.scheduler,
+        grad_clip=train_config.grad_clip,
+        class_weight=train_config.class_weight,
     )
 
     # Train fresh head
@@ -517,7 +580,6 @@ def run_ensemble_train_test(
         seed = base_seed + seed_offset
         rng = np.random.default_rng(seed)
 
-        # Pre-training augmentation
         if pretrain_aug_config is not None:
             Z_train_aug, y_train_aug = apply_pretrain_augmentation(
                 Z_train, y_train, pretrain_aug_config, rng,
@@ -543,6 +605,8 @@ def run_ensemble_train_test(
             early_stopping_patience=train_config.early_stopping_patience,
             augmentation=epoch_aug_config,
             device=train_config.device,
+            optimizer=train_config.optimizer,
+            scheduler=train_config.scheduler,
         )
 
         torch.manual_seed(seed)
@@ -564,19 +628,96 @@ def run_ensemble_train_test(
 
 
 # ============================================================================
+# Sklearn baseline
+# ============================================================================
+
+def build_sklearn_classifier(config: dict):
+    """Build sklearn classifier from config dict."""
+    from sklearn.svm import SVC
+    from sklearn.ensemble import (
+        RandomForestClassifier, GradientBoostingClassifier,
+        ExtraTreesClassifier, AdaBoostClassifier,
+    )
+    from sklearn.linear_model import LogisticRegression
+
+    clf_type = config["type"]
+    if clf_type == "svm":
+        return SVC(
+            kernel=config.get("kernel", "rbf"),
+            C=config.get("C", 1.0),
+            gamma=config.get("gamma", "scale"),
+            probability=True,
+            random_state=42,
+        )
+    elif clf_type == "random_forest":
+        return RandomForestClassifier(n_estimators=100, random_state=42)
+    elif clf_type == "gradient_boosting":
+        return GradientBoostingClassifier(n_estimators=100, random_state=42)
+    elif clf_type == "extra_trees":
+        return ExtraTreesClassifier(n_estimators=100, random_state=42)
+    elif clf_type == "logistic_regression":
+        return LogisticRegression(max_iter=1000, random_state=42)
+    elif clf_type == "adaboost":
+        return AdaBoostClassifier(n_estimators=100, random_state=42)
+    else:
+        raise ValueError(f"Unknown classifier type: {clf_type}")
+
+
+def run_sklearn_train_test(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    Z_test: np.ndarray,
+    y_test: np.ndarray,
+    clf_config: dict,
+) -> tuple[ClassificationMetrics, np.ndarray, np.ndarray]:
+    """Run sklearn classifier with train/test split."""
+    from sklearn.preprocessing import StandardScaler
+
+    scaler = StandardScaler()
+    Z_tr = scaler.fit_transform(Z_train)
+    Z_te = scaler.transform(Z_test)
+
+    clf = build_sklearn_classifier(clf_config)
+    clf.fit(Z_tr, y_train)
+
+    y_pred = clf.predict(Z_te)
+
+    # Probability extraction
+    y_prob = None
+    if hasattr(clf, "predict_proba"):
+        y_prob_full = clf.predict_proba(Z_te)
+        if hasattr(clf, "classes_") and len(clf.classes_) == 2:
+            pos_idx = list(clf.classes_).index(1) if 1 in clf.classes_ else 1
+            y_prob = y_prob_full[:, pos_idx]
+        elif y_prob_full.shape[1] >= 2:
+            y_prob = y_prob_full[:, 1]
+    elif hasattr(clf, "decision_function"):
+        y_prob = clf.decision_function(Z_te)
+
+    metrics = compute_metrics(y_test, y_pred, y_prob, class_names=["Empty", "Occupied"])
+    return metrics, y_pred, y_prob
+
+
+# ============================================================================
 # Result helpers
 # ============================================================================
 
-def _make_result_row(name: str, metrics: ClassificationMetrics, elapsed: float,
-                     extra: dict | None = None) -> dict:
-    """Build a standardized result dict."""
+def _make_result_row(
+    name: str, metrics: ClassificationMetrics, elapsed: float,
+    extra: dict | None = None,
+) -> dict:
+    """Build a standardized result dict (AUC-primary)."""
+    auc_val = metrics.roc_auc if not math.isnan(metrics.roc_auc) else None
+    eer_val = metrics.eer if not math.isnan(metrics.eer) else None
     row = {
         "name": name,
+        "auc": round(auc_val, 4) if auc_val is not None else None,
+        "eer": round(eer_val, 4) if eer_val is not None else None,
         "accuracy": round(metrics.accuracy, 4),
         "f1": round(metrics.f1, 4),
         "f1_macro": round(metrics.f1_macro, 4),
-        "auc": round(metrics.roc_auc, 4) if not np.isnan(metrics.roc_auc) else None,
-        "eer": round(metrics.eer, 4) if not np.isnan(metrics.eer) else None,
+        "precision": round(metrics.precision, 4),
+        "recall": round(metrics.recall, 4),
         "ci_lower": round(metrics.ci_lower, 4) if metrics.ci_lower is not None else None,
         "ci_upper": round(metrics.ci_upper, 4) if metrics.ci_upper is not None else None,
         "n_samples": metrics.n_samples,
@@ -587,34 +728,82 @@ def _make_result_row(name: str, metrics: ClassificationMetrics, elapsed: float,
     return row
 
 
+def _format_metrics_log(name: str, metrics: ClassificationMetrics, elapsed: float) -> str:
+    """Format comprehensive metric log line."""
+    parts = [f"  [{name}]"]
+    if not math.isnan(metrics.roc_auc):
+        parts.append(f"AUC={metrics.roc_auc:.4f}")
+    else:
+        parts.append("AUC=N/A")
+    if not math.isnan(metrics.eer):
+        parts.append(f"EER={metrics.eer:.4f}")
+    parts.append(f"Acc={metrics.accuracy:.4f}")
+    parts.append(f"F1={metrics.f1:.4f}")
+    parts.append(f"P={metrics.precision:.4f}")
+    parts.append(f"R={metrics.recall:.4f}")
+    if metrics.ci_lower is not None:
+        parts.append(f"CI=[{metrics.ci_lower:.4f},{metrics.ci_upper:.4f}]")
+    if metrics.confusion_matrix is not None and metrics.confusion_matrix.shape == (2, 2):
+        tn, fp, fn, tp = metrics.confusion_matrix.ravel()
+        parts.append(f"(TP={tp} TN={tn} FP={fp} FN={fn})")
+    parts.append(f"({elapsed:.1f}s)")
+    return "  ".join(parts)
+
+
+def _run_and_log(
+    name: str,
+    run_fn,
+    extra: dict | None = None,
+) -> dict | None:
+    """Execute experiment, log results, return result row or None on error."""
+    t0 = time.time()
+    try:
+        metrics, _, _ = run_fn()
+        elapsed = time.time() - t0
+        logger.info(_format_metrics_log(name, metrics, elapsed))
+        return _make_result_row(name, metrics, elapsed, extra=extra)
+    except Exception as e:
+        logger.error("  [%s] FAILED: %s", name, e)
+        row = {"name": name, "error": str(e)}
+        if extra:
+            row.update(extra)
+        return row
+
+
 # ============================================================================
-# Group A: Augmentation × Head Architecture (48 experiments)
+# Group D: Augmentation x Head Architecture (120 experiments)
 # ============================================================================
 
-# 8 augmentation strategies
-AUGMENTATION_CONFIGS = [
-    {"name": "no aug", "pretrain_aug": None, "epoch_aug": None},
-    {"name": "DC (a=0.5, n=50)", "pretrain_aug": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}, "epoch_aug": None},
-    {"name": "DC (a=0.3, n=100)", "pretrain_aug": {"strategy": "dc", "alpha": 0.3, "n_synthetic": 100}, "epoch_aug": None},
-    {"name": "SMOTE (k=5, n=30)", "pretrain_aug": {"strategy": "smote", "k": 5, "n_synthetic": 30}, "epoch_aug": None},
-    {"name": "FroFA (s=0.1)", "pretrain_aug": None, "epoch_aug": {"strategy": "frofa", "strength": 0.1}},
-    {"name": "Adaptive noise (s=0.1)", "pretrain_aug": None, "epoch_aug": {"strategy": "adaptive_noise", "scale": 0.1}},
-    {"name": "Within-class mixup (a=0.3)", "pretrain_aug": None, "epoch_aug": {"strategy": "within_class_mixup", "alpha": 0.3}},
-    {"name": "DC+FroFA combined", "pretrain_aug": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}, "epoch_aug": {"strategy": "frofa", "strength": 0.1}},
+AUGMENTATION_CONFIGS_D = [
+    {"name": "no_aug", "pretrain_aug": None, "epoch_aug": None},
+    {"name": "DC_a05_n50", "pretrain_aug": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}, "epoch_aug": None},
+    {"name": "DC_a03_n100", "pretrain_aug": {"strategy": "dc", "alpha": 0.3, "n_synthetic": 100}, "epoch_aug": None},
+    {"name": "DC_a07_n30", "pretrain_aug": {"strategy": "dc", "alpha": 0.7, "n_synthetic": 30}, "epoch_aug": None},
+    {"name": "SMOTE_k5_n30", "pretrain_aug": {"strategy": "smote", "k": 5, "n_synthetic": 30}, "epoch_aug": None},
+    {"name": "SMOTE_k3_n50", "pretrain_aug": {"strategy": "smote", "k": 3, "n_synthetic": 50}, "epoch_aug": None},
+    {"name": "FroFA_s01", "pretrain_aug": None, "epoch_aug": {"strategy": "frofa", "strength": 0.1}},
+    {"name": "FroFA_s005", "pretrain_aug": None, "epoch_aug": {"strategy": "frofa", "strength": 0.05}},
+    {"name": "AdaptNoise_s01", "pretrain_aug": None, "epoch_aug": {"strategy": "adaptive_noise", "scale": 0.1}},
+    {"name": "WCMixup_a03", "pretrain_aug": None, "epoch_aug": {"strategy": "within_class_mixup", "alpha": 0.3}},
 ]
 
-# 6 head architectures
-HEAD_CONFIGS = [
+HEAD_CONFIGS_D = [
     {"name": "Linear", "type": "linear", "kwargs": {}},
+    {"name": "MLP[32]-d0.5", "type": "mlp", "kwargs": {"hidden_dims": [32], "dropout": 0.5}},
     {"name": "MLP[64]-d0.5", "type": "mlp", "kwargs": {"hidden_dims": [64], "dropout": 0.5}},
     {"name": "MLP[128]-d0.5", "type": "mlp", "kwargs": {"hidden_dims": [128], "dropout": 0.5}},
+    {"name": "MLP[256]-d0.5", "type": "mlp", "kwargs": {"hidden_dims": [256], "dropout": 0.5}},
+    {"name": "MLP[64,32]-d0.5", "type": "mlp", "kwargs": {"hidden_dims": [64, 32], "dropout": 0.5}},
     {"name": "MLP[128,64]-d0.5", "type": "mlp", "kwargs": {"hidden_dims": [128, 64], "dropout": 0.5}},
+    {"name": "MLP[256,128]-d0.5", "type": "mlp", "kwargs": {"hidden_dims": [256, 128], "dropout": 0.5}},
     {"name": "MLP[64]-d0.3", "type": "mlp", "kwargs": {"hidden_dims": [64], "dropout": 0.3}},
     {"name": "MLP[64]-d0.7", "type": "mlp", "kwargs": {"hidden_dims": [64], "dropout": 0.7}},
+    {"name": "MLP[128]-d0.3", "type": "mlp", "kwargs": {"hidden_dims": [128], "dropout": 0.3}},
+    {"name": "MLP[128]-d0.7", "type": "mlp", "kwargs": {"hidden_dims": [128], "dropout": 0.7}},
 ]
 
 
-def run_group_a(
+def run_group_d(
     Z_train: np.ndarray,
     y_train: np.ndarray,
     Z_test: np.ndarray,
@@ -623,505 +812,955 @@ def run_group_a(
     seed: int,
     output_dir: Path,
 ) -> list[dict]:
-    """Sweep augmentation × head architecture.
+    """Sweep augmentation x head architecture.
 
-    8 augmentations × 6 heads = 48 experiments.
+    10 augmentations x 12 heads = 120 experiments.
     """
     logger.info("=" * 70)
-    logger.info("GROUP A: Augmentation × Head Architecture (48 experiments)")
+    logger.info("GROUP D: Augmentation x Head Architecture (120 experiments)")
     logger.info("=" * 70)
 
     embed_dim = Z_train.shape[1]
     n_classes = len(set(y_train.tolist()) | set(y_test.tolist()))
     results = []
+    total = len(AUGMENTATION_CONFIGS_D) * len(HEAD_CONFIGS_D)
 
-    for aug_cfg in AUGMENTATION_CONFIGS:
-        for head_cfg in HEAD_CONFIGS:
-            exp_name = f"{aug_cfg['name']} | {head_cfg['name']}"
-            logger.info("  %s", exp_name)
-            t0 = time.time()
+    for i, aug_cfg in enumerate(AUGMENTATION_CONFIGS_D):
+        for j, head_cfg in enumerate(HEAD_CONFIGS_D):
+            exp_idx = i * len(HEAD_CONFIGS_D) + j + 1
+            exp_name = f"{aug_cfg['name']}|{head_cfg['name']}"
+            logger.info("[%d/%d] %s", exp_idx, total, exp_name)
 
-            try:
-                def head_factory(hc=head_cfg):
-                    return build_head(hc["type"], embed_dim, n_classes, **hc["kwargs"])
+            def head_factory(hc=head_cfg):
+                return build_head(hc["type"], embed_dim, n_classes, **hc["kwargs"])
 
-                metrics, _, _ = run_neural_train_test(
+            row = _run_and_log(
+                exp_name,
+                lambda ac=aug_cfg, hf=head_factory: run_neural_train_test(
                     Z_train, y_train, Z_test, y_test,
-                    head_factory, train_config,
-                    pretrain_aug_config=aug_cfg["pretrain_aug"],
-                    epoch_aug_config=aug_cfg["epoch_aug"],
+                    hf, train_config,
+                    pretrain_aug_config=ac["pretrain_aug"],
+                    epoch_aug_config=ac["epoch_aug"],
                     seed=seed,
-                )
-                elapsed = time.time() - t0
+                ),
+                extra={
+                    "group": "D", "augmentation": aug_cfg["name"],
+                    "head": head_cfg["name"], "head_type": head_cfg["type"],
+                },
+            )
+            results.append(row)
 
-                n_params = sum(p.numel() for p in head_factory().parameters())
-                row = _make_result_row(exp_name, metrics, elapsed, extra={
-                    "group": "A",
-                    "augmentation": aug_cfg["name"],
-                    "head": head_cfg["name"],
-                    "head_type": head_cfg["type"],
-                    "n_params": n_params,
-                })
-                results.append(row)
-                logger.info(
-                    "    Acc=%.4f  F1=%.4f  AUC=%s  (%.1fs)",
-                    metrics.accuracy, metrics.f1,
-                    f"{metrics.roc_auc:.4f}" if not np.isnan(metrics.roc_auc) else "N/A",
-                    elapsed,
-                )
-            except Exception as e:
-                logger.error("    FAILED: %s", e)
-                results.append({
-                    "group": "A", "name": exp_name,
-                    "augmentation": aug_cfg["name"],
-                    "head": head_cfg["name"],
-                    "error": str(e),
-                })
-
-    # Save results
-    df = pd.DataFrame(results)
-    tables_dir = output_dir / "tables"
-    tables_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(tables_dir / "group_a_aug_head.csv", index=False)
-    logger.info("Saved: %s (%d rows)", tables_dir / "group_a_aug_head.csv", len(df))
-
+    _save_group_results(results, "D", "group_d_aug_head", output_dir)
     return results
 
 
 # ============================================================================
-# Group B: Layer Selection & Fusion (30 experiments)
+# Group E: Context Window Exploration (96 experiments)
 # ============================================================================
 
-# Single layer configs
-SINGLE_LAYER_CONFIGS = [{"name": f"L{l} only", "mode": "single", "layers": [l]} for l in ALL_LAYERS]
-
-# Concatenation combos (10)
-CONCAT_CONFIGS = [
-    {"name": "Concat L0+L3", "mode": "concat", "layers": [0, 3]},
-    {"name": "Concat L0+L5", "mode": "concat", "layers": [0, 5]},
-    {"name": "Concat L2+L3", "mode": "concat", "layers": [2, 3]},
-    {"name": "Concat L3+L5", "mode": "concat", "layers": [3, 5]},
-    {"name": "Concat L0+L2+L3", "mode": "concat", "layers": [0, 2, 3]},
-    {"name": "Concat L0+L3+L5", "mode": "concat", "layers": [0, 3, 5]},
-    {"name": "Concat L1+L3+L5", "mode": "concat", "layers": [1, 3, 5]},
-    {"name": "Concat L2+L3+L4", "mode": "concat", "layers": [2, 3, 4]},
-    {"name": "Concat L0+L2+L4+L5", "mode": "concat", "layers": [0, 2, 4, 5]},
-    {"name": "Concat All L0-L5", "mode": "concat", "layers": [0, 1, 2, 3, 4, 5]},
+GROUP_E_CONTEXTS = [
+    {"name": "3min", "before": 1, "after": 1},
+    {"name": "11min", "before": 5, "after": 5},
+    {"name": "21min", "before": 10, "after": 10},
+    {"name": "41min", "before": 20, "after": 20},
+    {"name": "61min", "before": 30, "after": 30},
+    {"name": "91min", "before": 45, "after": 45},
+    {"name": "121min", "before": 60, "after": 60},
+    {"name": "181min", "before": 90, "after": 90},
+    {"name": "221min", "before": 110, "after": 110},
+    {"name": "251min", "before": 125, "after": 125},
+    {"name": "311min", "before": 155, "after": 155},
+    {"name": "401min", "before": 200, "after": 200},
 ]
 
-# Fusion configs (5)
-FUSION_CONFIGS = [
-    {"name": "Fusion L2+L3+L4", "mode": "fusion", "layers": [2, 3, 4]},
-    {"name": "Fusion L0+L3+L5", "mode": "fusion", "layers": [0, 3, 5]},
-    {"name": "Fusion L1+L3+L5", "mode": "fusion", "layers": [1, 3, 5]},
-    {"name": "Fusion L0+L2+L4+L5", "mode": "fusion", "layers": [0, 2, 4, 5]},
-    {"name": "Fusion All L0-L5", "mode": "fusion", "layers": [0, 1, 2, 3, 4, 5]},
+GROUP_E_CHANNELS = [
+    {"name": "M+C", "keys": ["M", "C"]},
+    {"name": "M+C+T1", "keys": ["M", "C", "T1"]},
 ]
 
-# Attention pool configs (9)
-ATTENTION_CONFIGS = [
-    {"name": "Attn L0+L3", "mode": "attention", "layers": [0, 3]},
-    {"name": "Attn L2+L3+L4", "mode": "attention", "layers": [2, 3, 4]},
-    {"name": "Attn L0+L3+L5", "mode": "attention", "layers": [0, 3, 5]},
-    {"name": "Attn L1+L3+L5", "mode": "attention", "layers": [1, 3, 5]},
-    {"name": "Attn L0+L2+L4+L5", "mode": "attention", "layers": [0, 2, 4, 5]},
-    {"name": "Attn All L0-L5", "mode": "attention", "layers": [0, 1, 2, 3, 4, 5]},
-    {"name": "Attn L3+L4+L5", "mode": "attention", "layers": [3, 4, 5]},
-    {"name": "Attn L0+L1+L2", "mode": "attention", "layers": [0, 1, 2]},
-    {"name": "Attn L0+L5", "mode": "attention", "layers": [0, 5]},
+GROUP_E_CLASSIFIERS = [
+    {"name": "MLP[64]-d0.5", "type": "neural", "head_type": "mlp", "head_kwargs": {"hidden_dims": [64], "dropout": 0.5}},
+    {"name": "Linear", "type": "neural", "head_type": "linear", "head_kwargs": {}},
+    {"name": "SVM_rbf", "type": "sklearn", "clf_config": {"type": "svm", "kernel": "rbf", "C": 1.0}},
+    {"name": "LogReg", "type": "sklearn", "clf_config": {"type": "logistic_regression"}},
 ]
 
 
-def run_group_b(
+def run_group_e(
+    sensor_csv: str,
+    label_csv: str,
+    initial_occupancy: int,
+    split_date: str,
+    stride: int,
+    pretrained: str,
+    output_token: str,
+    primary_layer: int,
+    train_config: TrainConfig,
+    seed: int,
+    output_dir: Path,
+) -> list[dict]:
+    """Sweep context windows with neural + sklearn classifiers.
+
+    12 contexts x 2 channels x 4 classifiers = 96 experiments.
+    Requires re-extraction per context window.
+    """
+    logger.info("=" * 70)
+    logger.info("GROUP E: Context Window Exploration (96 experiments)")
+    logger.info("=" * 70)
+
+    device = train_config.device
+    total = len(GROUP_E_CONTEXTS) * len(GROUP_E_CHANNELS) * len(GROUP_E_CLASSIFIERS)
+
+    # Load MantisV2 model once
+    logger.info("Loading MantisV2 model (L%d)...", primary_layer)
+    model = load_mantis_model(pretrained, primary_layer, output_token, device)
+
+    results = []
+    exp_idx = 0
+
+    for ch_cfg in GROUP_E_CHANNELS:
+        # Load data for this channel set
+        channels = _resolve_channels(ch_cfg["keys"])
+        logger.info("Loading data for channels: %s", ch_cfg["name"])
+        prep = PreprocessConfig(
+            sensor_csv=sensor_csv,
+            label_csv=label_csv,
+            label_format="events",
+            initial_occupancy=initial_occupancy,
+            binarize=True,
+            channels=channels,
+        )
+        sensor_arr, train_labels, test_labels, _, timestamps = (
+            load_occupancy_data(prep, split_date=split_date)
+        )
+        all_labels = np.where(train_labels >= 0, train_labels, test_labels)
+
+        for ctx_cfg in GROUP_E_CONTEXTS:
+            # Build dataset with this context
+            ds_cfg = DatasetConfig(
+                context_mode="bidirectional",
+                context_before=ctx_cfg["before"],
+                context_after=ctx_cfg["after"],
+                stride=stride,
+            )
+            dataset = OccupancyDataset(sensor_arr, all_labels, timestamps, ds_cfg)
+            train_mask, test_mask = dataset.get_train_test_split(split_date)
+
+            n_train = int(train_mask.sum())
+            n_test = int(test_mask.sum())
+            if n_train < 10 or n_test < 10:
+                logger.warning("Skipping %s/%s: train=%d test=%d",
+                               ch_cfg["name"], ctx_cfg["name"], n_train, n_test)
+                continue
+
+            # Extract embeddings
+            Z = extract_embeddings(model, dataset, device)
+            Z_train = Z[train_mask]
+            Z_test = Z[test_mask]
+            y_train = dataset.labels[train_mask]
+            y_test = dataset.labels[test_mask]
+            embed_dim = Z_train.shape[1]
+            n_classes = len(set(y_train.tolist()) | set(y_test.tolist()))
+
+            for clf_cfg in GROUP_E_CLASSIFIERS:
+                exp_idx += 1
+                exp_name = f"{ch_cfg['name']}|{ctx_cfg['name']}|{clf_cfg['name']}"
+                logger.info("[%d/%d] %s (train=%d test=%d)", exp_idx, total, exp_name, n_train, n_test)
+
+                if clf_cfg["type"] == "neural":
+                    htype = clf_cfg["head_type"]
+                    hkw = clf_cfg["head_kwargs"]
+
+                    def head_factory(ht=htype, kw=hkw, ed=embed_dim, nc=n_classes):
+                        return build_head(ht, ed, nc, **kw)
+
+                    row = _run_and_log(
+                        exp_name,
+                        lambda hf=head_factory: run_neural_train_test(
+                            Z_train, y_train, Z_test, y_test,
+                            hf, train_config, seed=seed,
+                        ),
+                        extra={
+                            "group": "E", "channels": ch_cfg["name"],
+                            "context": ctx_cfg["name"],
+                            "context_min": ctx_cfg["before"] * 2 + 1,
+                            "classifier": clf_cfg["name"],
+                        },
+                    )
+                else:
+                    row = _run_and_log(
+                        exp_name,
+                        lambda cc=clf_cfg["clf_config"]: run_sklearn_train_test(
+                            Z_train, y_train, Z_test, y_test, cc,
+                        ),
+                        extra={
+                            "group": "E", "channels": ch_cfg["name"],
+                            "context": ctx_cfg["name"],
+                            "context_min": ctx_cfg["before"] * 2 + 1,
+                            "classifier": clf_cfg["name"],
+                        },
+                    )
+                results.append(row)
+
+            gc.collect()
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    _save_group_results(results, "E", "group_e_context", output_dir)
+    return results
+
+
+# ============================================================================
+# Group F: Layer x Fusion Strategy (80 experiments)
+# ============================================================================
+
+SINGLE_LAYER_HEADS = [
+    {"name": "MLP[64]-d0.5", "type": "mlp", "kwargs": {"hidden_dims": [64], "dropout": 0.5}},
+    {"name": "MLP[128]-d0.5", "type": "mlp", "kwargs": {"hidden_dims": [128], "dropout": 0.5}},
+    {"name": "Linear", "type": "linear", "kwargs": {}},
+    {"name": "SVM_rbf", "type": "sklearn", "clf_config": {"type": "svm", "kernel": "rbf"}},
+]
+
+CONCAT_COMBOS = [
+    {"name": "L0+L2", "layers": [0, 2]},
+    {"name": "L0+L5", "layers": [0, 5]},
+    {"name": "L2+L3", "layers": [2, 3]},
+    {"name": "L2+L5", "layers": [2, 5]},
+    {"name": "L0+L2+L5", "layers": [0, 2, 5]},
+    {"name": "L0+L3+L5", "layers": [0, 3, 5]},
+    {"name": "L2+L3+L4", "layers": [2, 3, 4]},
+    {"name": "L1+L3+L5", "layers": [1, 3, 5]},
+    {"name": "L0+L2+L3+L5", "layers": [0, 2, 3, 5]},
+    {"name": "L0+L2+L4+L5", "layers": [0, 2, 4, 5]},
+    {"name": "L2+L3+L4+L5", "layers": [2, 3, 4, 5]},
+    {"name": "All_L0-L5", "layers": [0, 1, 2, 3, 4, 5]},
+]
+
+FUSION_COMBOS = [
+    {"name": "Fusion_L2+L3", "layers": [2, 3]},
+    {"name": "Fusion_L2+L5", "layers": [2, 5]},
+    {"name": "Fusion_L0+L3+L5", "layers": [0, 3, 5]},
+    {"name": "Fusion_L2+L3+L4", "layers": [2, 3, 4]},
+    {"name": "Fusion_L0+L2+L5", "layers": [0, 2, 5]},
+    {"name": "Fusion_L1+L3+L5", "layers": [1, 3, 5]},
+    {"name": "Fusion_L0+L2+L4+L5", "layers": [0, 2, 4, 5]},
+    {"name": "Fusion_All", "layers": [0, 1, 2, 3, 4, 5]},
+]
+
+ATTENTION_COMBOS = [
+    {"name": "Attn_L2+L3", "layers": [2, 3]},
+    {"name": "Attn_L2+L5", "layers": [2, 5]},
+    {"name": "Attn_L0+L3+L5", "layers": [0, 3, 5]},
+    {"name": "Attn_L2+L3+L4", "layers": [2, 3, 4]},
+    {"name": "Attn_L0+L2+L5", "layers": [0, 2, 5]},
+    {"name": "Attn_L0+L2+L4+L5", "layers": [0, 2, 4, 5]},
+    {"name": "Attn_L3+L4+L5", "layers": [3, 4, 5]},
+    {"name": "Attn_All", "layers": [0, 1, 2, 3, 4, 5]},
+]
+
+
+def run_group_f(
     all_Z_train: dict[int, np.ndarray],
     all_Z_test: dict[int, np.ndarray],
     y_train: np.ndarray,
     y_test: np.ndarray,
     train_config: TrainConfig,
-    best_aug: dict,
     seed: int,
     output_dir: Path,
 ) -> list[dict]:
-    """Sweep layer combinations.
+    """Sweep layer combinations: single, concat, fusion, attention.
 
-    6 single + 10 concat + 5 fusion + 9 attention = 30 experiments.
+    ~80 experiments total.
     """
     logger.info("=" * 70)
-    logger.info("GROUP B: Layer Selection & Fusion (30 experiments)")
+    logger.info("GROUP F: Layer x Fusion Strategy (~80 experiments)")
     logger.info("=" * 70)
 
     embed_dim = next(iter(all_Z_train.values())).shape[1]
     n_classes = len(set(y_train.tolist()) | set(y_test.tolist()))
-
-    best_pretrain = best_aug.get("pretrain_aug")
-    best_epoch = best_aug.get("epoch_aug")
-
-    all_configs = SINGLE_LAYER_CONFIGS + CONCAT_CONFIGS + FUSION_CONFIGS + ATTENTION_CONFIGS
     results = []
+    exp_idx = 0
 
-    for cfg in all_configs:
-        exp_name = cfg["name"]
-        logger.info("  %s", exp_name)
-        t0 = time.time()
+    # Part F1: Single layers x 4 heads = 24
+    logger.info("--- Part F1: Single Layer x Head (24 experiments) ---")
+    for layer in ALL_LAYERS:
+        Z_tr = all_Z_train[layer]
+        Z_te = all_Z_test[layer]
+        for head_cfg in SINGLE_LAYER_HEADS:
+            exp_idx += 1
+            exp_name = f"L{layer}|{head_cfg['name']}"
+            logger.info("[%d] %s", exp_idx, exp_name)
 
-        try:
-            if cfg["mode"] == "single":
-                layer = cfg["layers"][0]
-                Z_tr = all_Z_train[layer]
-                Z_te = all_Z_test[layer]
-
-                def head_factory(ed=embed_dim):
-                    return build_head("mlp", ed, n_classes, hidden_dims=[64], dropout=0.5)
-
-                metrics, _, _ = run_neural_train_test(
-                    Z_tr, y_train, Z_te, y_test,
-                    head_factory, train_config,
-                    pretrain_aug_config=best_pretrain,
-                    epoch_aug_config=best_epoch,
-                    seed=seed,
-                )
-
-            elif cfg["mode"] == "concat":
-                Z_tr = np.concatenate([all_Z_train[l] for l in cfg["layers"]], axis=1)
-                Z_te = np.concatenate([all_Z_test[l] for l in cfg["layers"]], axis=1)
-                concat_dim = Z_tr.shape[1]
-                concat_hidden = [min(256, concat_dim // 2), 128]
-
-                def head_factory(cd=concat_dim, ch=concat_hidden):
-                    return build_head("mlp", cd, n_classes, hidden_dims=ch, dropout=0.5)
-
-                metrics, _, _ = run_neural_train_test(
-                    Z_tr, y_train, Z_te, y_test,
-                    head_factory, train_config,
-                    pretrain_aug_config=best_pretrain,
-                    epoch_aug_config=best_epoch,
-                    seed=seed,
-                )
-
-            elif cfg["mode"] == "fusion":
-                n_layers = len(cfg["layers"])
-
-                def head_factory(nl=n_layers):
-                    return build_head(
-                        "multi_layer_fusion", embed_dim, n_classes,
-                        n_layers=nl, hidden_dims=[64], dropout=0.5,
-                    )
-
-                metrics, _, _ = run_neural_train_test_multi_layer(
-                    all_Z_train, all_Z_test, cfg["layers"],
-                    y_train, y_test, head_factory, train_config, seed,
-                )
-
-            elif cfg["mode"] == "attention":
-                n_layers = len(cfg["layers"])
-
-                def head_factory(nl=n_layers):
-                    return build_head(
-                        "attention_pool", embed_dim, n_classes,
-                        n_layers=nl, hidden_dims=[64], dropout=0.5,
-                    )
-
-                metrics, _, _ = run_neural_train_test_multi_layer(
-                    all_Z_train, all_Z_test, cfg["layers"],
-                    y_train, y_test, head_factory, train_config, seed,
+            if head_cfg["type"] == "sklearn":
+                row = _run_and_log(
+                    exp_name,
+                    lambda zt=Z_tr, ze=Z_te, cc=head_cfg["clf_config"]: (
+                        run_sklearn_train_test(zt, y_train, ze, y_test, cc)
+                    ),
+                    extra={"group": "F", "subgroup": "single", "layer": layer, "head": head_cfg["name"]},
                 )
             else:
-                continue
+                def head_factory(hc=head_cfg, ed=embed_dim):
+                    return build_head(hc["type"], ed, n_classes, **hc["kwargs"])
 
-            elapsed = time.time() - t0
-
-            row = _make_result_row(exp_name, metrics, elapsed, extra={
-                "group": "B",
-                "mode": cfg["mode"],
-                "layers": cfg["layers"],
-                "n_layers": len(cfg["layers"]),
-            })
+                row = _run_and_log(
+                    exp_name,
+                    lambda zt=Z_tr, ze=Z_te, hf=head_factory: run_neural_train_test(
+                        zt, y_train, ze, y_test, hf, train_config, seed=seed,
+                    ),
+                    extra={"group": "F", "subgroup": "single", "layer": layer, "head": head_cfg["name"]},
+                )
             results.append(row)
-            logger.info(
-                "    Acc=%.4f  F1=%.4f  AUC=%s  (%.1fs)",
-                metrics.accuracy, metrics.f1,
-                f"{metrics.roc_auc:.4f}" if not np.isnan(metrics.roc_auc) else "N/A",
-                elapsed,
+
+    # Part F2: Concat combos x 2 heads = 24
+    logger.info("--- Part F2: Concatenation (24 experiments) ---")
+    for combo in CONCAT_COMBOS:
+        Z_tr = np.concatenate([all_Z_train[l] for l in combo["layers"]], axis=1)
+        Z_te = np.concatenate([all_Z_test[l] for l in combo["layers"]], axis=1)
+        concat_dim = Z_tr.shape[1]
+
+        for hidden in [[min(256, concat_dim // 2), 64], [128, 64]]:
+            exp_idx += 1
+            h_str = "x".join(str(h) for h in hidden)
+            exp_name = f"Concat_{combo['name']}|MLP[{h_str}]"
+            logger.info("[%d] %s (dim=%d)", exp_idx, exp_name, concat_dim)
+
+            def head_factory(cd=concat_dim, hd=hidden):
+                return build_head("mlp", cd, n_classes, hidden_dims=hd, dropout=0.5)
+
+            row = _run_and_log(
+                exp_name,
+                lambda zt=Z_tr, ze=Z_te, hf=head_factory: run_neural_train_test(
+                    zt, y_train, ze, y_test, hf, train_config, seed=seed,
+                ),
+                extra={"group": "F", "subgroup": "concat", "layers": combo["layers"]},
             )
-        except Exception as e:
-            logger.error("    FAILED: %s", e)
-            results.append({
-                "group": "B", "name": exp_name, "error": str(e),
-            })
+            results.append(row)
 
-    df = pd.DataFrame(results)
-    tables_dir = output_dir / "tables"
-    tables_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(tables_dir / "group_b_layer_fusion.csv", index=False)
-    logger.info("Saved: %s (%d rows)", tables_dir / "group_b_layer_fusion.csv", len(df))
+    # Part F3: Fusion combos = 8
+    logger.info("--- Part F3: Learnable Fusion (8 experiments) ---")
+    for combo in FUSION_COMBOS:
+        exp_idx += 1
+        exp_name = combo["name"]
+        logger.info("[%d] %s", exp_idx, exp_name)
+        nl = len(combo["layers"])
 
+        def head_factory(n_layers=nl):
+            return build_head(
+                "multi_layer_fusion", embed_dim, n_classes,
+                n_layers=n_layers, hidden_dims=[64], dropout=0.5,
+            )
+
+        row = _run_and_log(
+            exp_name,
+            lambda li=combo["layers"], hf=head_factory: run_neural_train_test_multi_layer(
+                all_Z_train, all_Z_test, li, y_train, y_test,
+                hf, train_config, seed,
+            ),
+            extra={"group": "F", "subgroup": "fusion", "layers": combo["layers"]},
+        )
+        results.append(row)
+
+    # Part F4: Attention pool = 8
+    logger.info("--- Part F4: Attention Pool (8 experiments) ---")
+    for combo in ATTENTION_COMBOS:
+        exp_idx += 1
+        exp_name = combo["name"]
+        logger.info("[%d] %s", exp_idx, exp_name)
+        nl = len(combo["layers"])
+
+        def head_factory(n_layers=nl):
+            return build_head(
+                "attention_pool", embed_dim, n_classes,
+                n_layers=n_layers, hidden_dims=[64], dropout=0.5,
+            )
+
+        row = _run_and_log(
+            exp_name,
+            lambda li=combo["layers"], hf=head_factory: run_neural_train_test_multi_layer(
+                all_Z_train, all_Z_test, li, y_train, y_test,
+                hf, train_config, seed,
+            ),
+            extra={"group": "F", "subgroup": "attention", "layers": combo["layers"]},
+        )
+        results.append(row)
+
+    _save_group_results(results, "F", "group_f_layer_fusion", output_dir)
     return results
 
 
 # ============================================================================
-# Group C: Training Hyperparameters + TTA + Ensemble (42 experiments)
+# Group G: Training Hyperparameters (90 experiments)
 # ============================================================================
 
-# LR × Weight Decay grid (18 configs)
-LR_VALUES = [5e-4, 1e-3, 2e-3, 5e-3, 1e-2, 2e-2]
-WD_VALUES = [0.0, 0.01, 0.1]
-
-# TTA configs (6)
-TTA_CONFIGS = [
-    {"name": "TTA-3 FroFA s=0.05", "tta_k": 3, "tta_strategy": "frofa", "tta_strength": 0.05},
-    {"name": "TTA-5 FroFA s=0.1", "tta_k": 5, "tta_strategy": "frofa", "tta_strength": 0.1},
-    {"name": "TTA-10 FroFA s=0.1", "tta_k": 10, "tta_strategy": "frofa", "tta_strength": 0.1},
-    {"name": "TTA-5 FroFA s=0.2", "tta_k": 5, "tta_strategy": "frofa", "tta_strength": 0.2},
-    {"name": "TTA-5 AdaptNoise s=0.1", "tta_k": 5, "tta_strategy": "adaptive_noise", "tta_strength": 0.1},
-    {"name": "TTA-10 AdaptNoise s=0.1", "tta_k": 10, "tta_strategy": "adaptive_noise", "tta_strength": 0.1},
-]
-
-# Ensemble configs (6)
-ENSEMBLE_CONFIGS = [
-    {"name": "Ensemble 3-seed", "n_seeds": 3},
-    {"name": "Ensemble 5-seed", "n_seeds": 5},
-    {"name": "Ensemble 7-seed", "n_seeds": 7},
-    {"name": "Ensemble 10-seed", "n_seeds": 10},
-    {"name": "Ensemble 5-seed + DC", "n_seeds": 5, "pretrain_aug": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}},
-    {"name": "Ensemble 5-seed + FroFA", "n_seeds": 5, "epoch_aug": {"strategy": "frofa", "strength": 0.1}},
-]
-
-# Label smoothing (3)
-LS_VALUES = [0.0, 0.05, 0.1]
-
-# Epoch/patience combos (6)
-EP_PATIENCE_CONFIGS = [
-    {"name": "100ep/20pat", "epochs": 100, "patience": 20},
-    {"name": "200ep/30pat", "epochs": 200, "patience": 30},
-    {"name": "300ep/50pat", "epochs": 300, "patience": 50},
-    {"name": "500ep/50pat", "epochs": 500, "patience": 50},
-    {"name": "200ep/10pat", "epochs": 200, "patience": 10},
-    {"name": "100ep/50pat", "epochs": 100, "patience": 50},
-]
-
-
-def run_group_c(
+def run_group_g(
     Z_train: np.ndarray,
     y_train: np.ndarray,
     Z_test: np.ndarray,
     y_test: np.ndarray,
     base_train_config: TrainConfig,
-    best_aug: dict,
-    best_head_cfg: dict,
     seed: int,
     output_dir: Path,
 ) -> list[dict]:
-    """Sweep training hyperparameters + TTA + ensemble.
+    """Sweep training hyperparameters: LR, WD, optimizer, scheduler, etc.
 
-    18 LR×WD + 6 TTA + 6 ensemble + 3 label smoothing + 6 epoch/patience
-    = ~39 experiments (some overlap, ~42 total with variants).
+    ~90 experiments.
     """
     logger.info("=" * 70)
-    logger.info("GROUP C: Training Hyperparameters + TTA + Ensemble")
+    logger.info("GROUP G: Training Hyperparameters (~90 experiments)")
     logger.info("=" * 70)
 
     embed_dim = Z_train.shape[1]
     n_classes = len(set(y_train.tolist()) | set(y_test.tolist()))
-    best_pretrain = best_aug.get("pretrain_aug")
-    best_epoch = best_aug.get("epoch_aug")
-    head_type = best_head_cfg.get("type", "mlp")
-    head_kwargs = best_head_cfg.get("kwargs", {"hidden_dims": [64], "dropout": 0.5})
-
     results = []
+    exp_idx = 0
 
-    # --- Part 1: LR × Weight Decay grid (18 configs) ---
-    logger.info("--- Part 1: LR × Weight Decay grid (18 configs) ---")
-    for lr in LR_VALUES:
-        for wd in WD_VALUES:
-            exp_name = f"LR={lr:.0e} WD={wd}"
-            logger.info("  %s", exp_name)
-            t0 = time.time()
+    def default_head_factory():
+        return build_head("mlp", embed_dim, n_classes, hidden_dims=[64], dropout=0.5)
 
-            try:
-                tc = TrainConfig(
-                    epochs=base_train_config.epochs,
-                    lr=lr,
-                    weight_decay=wd,
-                    label_smoothing=base_train_config.label_smoothing,
-                    early_stopping_patience=base_train_config.early_stopping_patience,
-                    device=base_train_config.device,
-                )
+    # Part G1: LR x WD grid = 40
+    logger.info("--- Part G1: LR x WD grid (40 experiments) ---")
+    lr_values = [1e-4, 3e-4, 5e-4, 1e-3, 2e-3, 5e-3, 1e-2, 2e-2]
+    wd_values = [0.0, 0.001, 0.01, 0.05, 0.1]
 
-                def head_factory(ht=head_type, kw=head_kwargs):
-                    return build_head(ht, embed_dim, n_classes, **kw)
+    for lr in lr_values:
+        for wd in wd_values:
+            exp_idx += 1
+            exp_name = f"LR={lr:.0e}_WD={wd}"
+            logger.info("[%d] %s", exp_idx, exp_name)
 
-                metrics, _, _ = run_neural_train_test(
-                    Z_train, y_train, Z_test, y_test,
-                    head_factory, tc,
-                    pretrain_aug_config=best_pretrain,
-                    epoch_aug_config=best_epoch,
-                    seed=seed,
-                )
-                elapsed = time.time() - t0
-
-                row = _make_result_row(exp_name, metrics, elapsed, extra={
-                    "group": "C", "subgroup": "lr_wd",
-                    "lr": lr, "weight_decay": wd,
-                })
-                results.append(row)
-                logger.info(
-                    "    Acc=%.4f  F1=%.4f  (%.1fs)",
-                    metrics.accuracy, metrics.f1, elapsed,
-                )
-            except Exception as e:
-                logger.error("    FAILED: %s", e)
-                results.append({"group": "C", "name": exp_name, "error": str(e)})
-
-    # --- Part 2: TTA configs (6) ---
-    logger.info("--- Part 2: TTA configs (6) ---")
-    for tta_cfg in TTA_CONFIGS:
-        exp_name = tta_cfg["name"]
-        logger.info("  %s", exp_name)
-        t0 = time.time()
-
-        try:
-            def head_factory(ht=head_type, kw=head_kwargs):
-                return build_head(ht, embed_dim, n_classes, **kw)
-
-            metrics, _, _ = run_tta_train_test(
-                Z_train, y_train, Z_test, y_test,
-                head_factory, base_train_config,
-                tta_k=tta_cfg["tta_k"],
-                tta_strategy=tta_cfg["tta_strategy"],
-                tta_strength=tta_cfg["tta_strength"],
-                pretrain_aug_config=best_pretrain,
-                seed=seed,
-            )
-            elapsed = time.time() - t0
-
-            row = _make_result_row(exp_name, metrics, elapsed, extra={
-                "group": "C", "subgroup": "tta",
-                "tta_k": tta_cfg["tta_k"],
-                "tta_strategy": tta_cfg["tta_strategy"],
-            })
-            results.append(row)
-            logger.info("    Acc=%.4f  F1=%.4f  (%.1fs)", metrics.accuracy, metrics.f1, elapsed)
-        except Exception as e:
-            logger.error("    FAILED: %s", e)
-            results.append({"group": "C", "name": exp_name, "error": str(e)})
-
-    # --- Part 3: Ensemble configs (6) ---
-    logger.info("--- Part 3: Ensemble configs (6) ---")
-    for ens_cfg in ENSEMBLE_CONFIGS:
-        exp_name = ens_cfg["name"]
-        logger.info("  %s", exp_name)
-        t0 = time.time()
-
-        try:
-            def head_factory(ht=head_type, kw=head_kwargs):
-                return build_head(ht, embed_dim, n_classes, **kw)
-
-            metrics, _, _ = run_ensemble_train_test(
-                Z_train, y_train, Z_test, y_test,
-                head_factory, base_train_config,
-                n_seeds=ens_cfg["n_seeds"],
-                base_seed=seed,
-                pretrain_aug_config=ens_cfg.get("pretrain_aug", best_pretrain),
-                epoch_aug_config=ens_cfg.get("epoch_aug", best_epoch),
-            )
-            elapsed = time.time() - t0
-
-            row = _make_result_row(exp_name, metrics, elapsed, extra={
-                "group": "C", "subgroup": "ensemble",
-                "n_seeds": ens_cfg["n_seeds"],
-            })
-            results.append(row)
-            logger.info("    Acc=%.4f  F1=%.4f  (%.1fs)", metrics.accuracy, metrics.f1, elapsed)
-        except Exception as e:
-            logger.error("    FAILED: %s", e)
-            results.append({"group": "C", "name": exp_name, "error": str(e)})
-
-    # --- Part 4: Label smoothing (3) ---
-    logger.info("--- Part 4: Label smoothing (3) ---")
-    for ls in LS_VALUES:
-        exp_name = f"LabelSmooth={ls}"
-        logger.info("  %s", exp_name)
-        t0 = time.time()
-
-        try:
             tc = TrainConfig(
                 epochs=base_train_config.epochs,
-                lr=base_train_config.lr,
-                weight_decay=base_train_config.weight_decay,
-                label_smoothing=ls,
+                lr=lr, weight_decay=wd,
+                label_smoothing=base_train_config.label_smoothing,
                 early_stopping_patience=base_train_config.early_stopping_patience,
                 device=base_train_config.device,
             )
-
-            def head_factory(ht=head_type, kw=head_kwargs):
-                return build_head(ht, embed_dim, n_classes, **kw)
-
-            metrics, _, _ = run_neural_train_test(
-                Z_train, y_train, Z_test, y_test,
-                head_factory, tc,
-                pretrain_aug_config=best_pretrain,
-                epoch_aug_config=best_epoch,
-                seed=seed,
+            row = _run_and_log(
+                exp_name,
+                lambda tc_=tc: run_neural_train_test(
+                    Z_train, y_train, Z_test, y_test,
+                    default_head_factory, tc_, seed=seed,
+                ),
+                extra={"group": "G", "subgroup": "lr_wd", "lr": lr, "weight_decay": wd},
             )
-            elapsed = time.time() - t0
-
-            row = _make_result_row(exp_name, metrics, elapsed, extra={
-                "group": "C", "subgroup": "label_smoothing",
-                "label_smoothing": ls,
-            })
             results.append(row)
-            logger.info("    Acc=%.4f  F1=%.4f  (%.1fs)", metrics.accuracy, metrics.f1, elapsed)
-        except Exception as e:
-            logger.error("    FAILED: %s", e)
-            results.append({"group": "C", "name": exp_name, "error": str(e)})
 
-    # --- Part 5: Epoch/patience combos (6) ---
-    logger.info("--- Part 5: Epoch/patience combos (6) ---")
-    for ep_cfg in EP_PATIENCE_CONFIGS:
-        exp_name = ep_cfg["name"]
-        logger.info("  %s", exp_name)
-        t0 = time.time()
+    # Part G2: Optimizer comparison x 3 LRs = 15
+    logger.info("--- Part G2: Optimizer comparison (15 experiments) ---")
+    optimizers = ["adamw", "adam", "sgd", "rmsprop"]
+    opt_lrs = [5e-4, 1e-3, 5e-3]
+    # SGD needs higher LR typically
+    for opt_name in optimizers:
+        for lr in opt_lrs:
+            exp_idx += 1
+            exp_name = f"{opt_name}_LR={lr:.0e}"
+            logger.info("[%d] %s", exp_idx, exp_name)
 
-        try:
             tc = TrainConfig(
-                epochs=ep_cfg["epochs"],
-                lr=base_train_config.lr,
-                weight_decay=base_train_config.weight_decay,
-                label_smoothing=base_train_config.label_smoothing,
-                early_stopping_patience=ep_cfg["patience"],
+                epochs=base_train_config.epochs,
+                lr=lr, weight_decay=0.01,
+                early_stopping_patience=base_train_config.early_stopping_patience,
                 device=base_train_config.device,
+                optimizer=opt_name,
             )
+            row = _run_and_log(
+                exp_name,
+                lambda tc_=tc: run_neural_train_test(
+                    Z_train, y_train, Z_test, y_test,
+                    default_head_factory, tc_, seed=seed,
+                ),
+                extra={"group": "G", "subgroup": "optimizer", "optimizer": opt_name, "lr": lr},
+            )
+            results.append(row)
+
+    # Part G3: Scheduler comparison x 3 LRs = 15
+    logger.info("--- Part G3: Scheduler comparison (15 experiments) ---")
+    schedulers = ["cosine", "step", "onecycle", "plateau", "none"]
+    for sched in schedulers:
+        for lr in opt_lrs:
+            exp_idx += 1
+            exp_name = f"sched_{sched}_LR={lr:.0e}"
+            logger.info("[%d] %s", exp_idx, exp_name)
+
+            tc = TrainConfig(
+                epochs=base_train_config.epochs,
+                lr=lr, weight_decay=0.01,
+                early_stopping_patience=base_train_config.early_stopping_patience,
+                device=base_train_config.device,
+                scheduler=sched,
+            )
+            row = _run_and_log(
+                exp_name,
+                lambda tc_=tc: run_neural_train_test(
+                    Z_train, y_train, Z_test, y_test,
+                    default_head_factory, tc_, seed=seed,
+                ),
+                extra={"group": "G", "subgroup": "scheduler", "scheduler": sched, "lr": lr},
+            )
+            results.append(row)
+
+    # Part G4: Label smoothing = 6
+    logger.info("--- Part G4: Label smoothing (6 experiments) ---")
+    for ls in [0.0, 0.01, 0.03, 0.05, 0.1, 0.15]:
+        exp_idx += 1
+        exp_name = f"LS={ls}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        tc = TrainConfig(
+            epochs=base_train_config.epochs,
+            lr=base_train_config.lr, weight_decay=base_train_config.weight_decay,
+            label_smoothing=ls,
+            early_stopping_patience=base_train_config.early_stopping_patience,
+            device=base_train_config.device,
+        )
+        row = _run_and_log(
+            exp_name,
+            lambda tc_=tc: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, tc_, seed=seed,
+            ),
+            extra={"group": "G", "subgroup": "label_smoothing", "label_smoothing": ls},
+        )
+        results.append(row)
+
+    # Part G5: Epoch/patience combos = 8
+    logger.info("--- Part G5: Epoch/patience (8 experiments) ---")
+    ep_configs = [
+        (100, 15), (100, 30), (200, 20), (200, 30),
+        (200, 50), (300, 30), (300, 50), (500, 50),
+    ]
+    for epochs, patience in ep_configs:
+        exp_idx += 1
+        exp_name = f"{epochs}ep_{patience}pat"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        tc = TrainConfig(
+            epochs=epochs,
+            lr=base_train_config.lr, weight_decay=base_train_config.weight_decay,
+            early_stopping_patience=patience,
+            device=base_train_config.device,
+        )
+        row = _run_and_log(
+            exp_name,
+            lambda tc_=tc: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, tc_, seed=seed,
+            ),
+            extra={"group": "G", "subgroup": "ep_patience", "epochs": epochs, "patience": patience},
+        )
+        results.append(row)
+
+    # Part G6: Grad clipping = 4
+    logger.info("--- Part G6: Gradient clipping (4 experiments) ---")
+    for gc_val in [0.5, 1.0, 5.0, 10.0]:
+        exp_idx += 1
+        exp_name = f"GradClip={gc_val}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        tc = TrainConfig(
+            epochs=base_train_config.epochs,
+            lr=base_train_config.lr, weight_decay=base_train_config.weight_decay,
+            early_stopping_patience=base_train_config.early_stopping_patience,
+            device=base_train_config.device,
+            grad_clip=gc_val,
+        )
+        row = _run_and_log(
+            exp_name,
+            lambda tc_=tc: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, tc_, seed=seed,
+            ),
+            extra={"group": "G", "subgroup": "grad_clip", "grad_clip": gc_val},
+        )
+        results.append(row)
+
+    # Part G7: BN vs no-BN = 2
+    logger.info("--- Part G7: BatchNorm ablation (2 experiments) ---")
+    for use_bn, bn_name in [(True, "BN"), (False, "noBN")]:
+        exp_idx += 1
+        exp_name = f"MLP[64]-d0.5_{bn_name}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        def head_factory(bn=use_bn):
+            return build_head("mlp", embed_dim, n_classes,
+                              hidden_dims=[64], dropout=0.5, use_batchnorm=bn)
+
+        row = _run_and_log(
+            exp_name,
+            lambda hf=head_factory: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                hf, base_train_config, seed=seed,
+            ),
+            extra={"group": "G", "subgroup": "batchnorm", "use_batchnorm": use_bn},
+        )
+        results.append(row)
+
+    _save_group_results(results, "G", "group_g_training_hp", output_dir)
+    return results
+
+
+# ============================================================================
+# Group H: Augmentation Deep Dive (70 experiments)
+# ============================================================================
+
+def run_group_h(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    Z_test: np.ndarray,
+    y_test: np.ndarray,
+    train_config: TrainConfig,
+    seed: int,
+    output_dir: Path,
+) -> list[dict]:
+    """Systematic augmentation parameter optimization.
+
+    ~70 experiments.
+    """
+    logger.info("=" * 70)
+    logger.info("GROUP H: Augmentation Deep Dive (~70 experiments)")
+    logger.info("=" * 70)
+
+    embed_dim = Z_train.shape[1]
+    n_classes = len(set(y_train.tolist()) | set(y_test.tolist()))
+    results = []
+    exp_idx = 0
+
+    def default_head_factory():
+        return build_head("mlp", embed_dim, n_classes, hidden_dims=[64], dropout=0.5)
+
+    # Part H1: DC param grid = 20
+    logger.info("--- Part H1: Distribution Calibration grid (20 experiments) ---")
+    for alpha in [0.1, 0.3, 0.5, 0.7, 1.0]:
+        for n_synth in [20, 50, 100, 200]:
+            exp_idx += 1
+            exp_name = f"DC_a{alpha}_n{n_synth}"
+            logger.info("[%d] %s", exp_idx, exp_name)
+
+            pretrain_aug = {"strategy": "dc", "alpha": alpha, "n_synthetic": n_synth}
+            row = _run_and_log(
+                exp_name,
+                lambda pa=pretrain_aug: run_neural_train_test(
+                    Z_train, y_train, Z_test, y_test,
+                    default_head_factory, train_config,
+                    pretrain_aug_config=pa, seed=seed,
+                ),
+                extra={"group": "H", "subgroup": "dc", "dc_alpha": alpha, "dc_n": n_synth},
+            )
+            results.append(row)
+
+    # Part H2: SMOTE param grid = 9
+    logger.info("--- Part H2: SMOTE grid (9 experiments) ---")
+    for k in [3, 5, 7]:
+        for n_synth in [20, 50, 100]:
+            exp_idx += 1
+            exp_name = f"SMOTE_k{k}_n{n_synth}"
+            logger.info("[%d] %s", exp_idx, exp_name)
+
+            pretrain_aug = {"strategy": "smote", "k": k, "n_synthetic": n_synth}
+            row = _run_and_log(
+                exp_name,
+                lambda pa=pretrain_aug: run_neural_train_test(
+                    Z_train, y_train, Z_test, y_test,
+                    default_head_factory, train_config,
+                    pretrain_aug_config=pa, seed=seed,
+                ),
+                extra={"group": "H", "subgroup": "smote", "smote_k": k, "smote_n": n_synth},
+            )
+            results.append(row)
+
+    # Part H3: FroFA strength sweep = 7
+    logger.info("--- Part H3: FroFA strength (7 experiments) ---")
+    for s in [0.01, 0.03, 0.05, 0.1, 0.15, 0.2, 0.3]:
+        exp_idx += 1
+        exp_name = f"FroFA_s{s}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        epoch_aug = {"strategy": "frofa", "strength": s}
+        row = _run_and_log(
+            exp_name,
+            lambda ea=epoch_aug: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, train_config,
+                epoch_aug_config=ea, seed=seed,
+            ),
+            extra={"group": "H", "subgroup": "frofa", "frofa_strength": s},
+        )
+        results.append(row)
+
+    # Part H4: Adaptive noise scale = 6
+    logger.info("--- Part H4: Adaptive noise (6 experiments) ---")
+    for s in [0.01, 0.03, 0.05, 0.1, 0.2, 0.3]:
+        exp_idx += 1
+        exp_name = f"AdaptNoise_s{s}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        epoch_aug = {"strategy": "adaptive_noise", "scale": s}
+        row = _run_and_log(
+            exp_name,
+            lambda ea=epoch_aug: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, train_config,
+                epoch_aug_config=ea, seed=seed,
+            ),
+            extra={"group": "H", "subgroup": "adaptive_noise", "noise_scale": s},
+        )
+        results.append(row)
+
+    # Part H5: Within-class mixup alpha = 6
+    logger.info("--- Part H5: Within-class mixup (6 experiments) ---")
+    for a in [0.1, 0.2, 0.3, 0.5, 0.7, 1.0]:
+        exp_idx += 1
+        exp_name = f"WCMixup_a{a}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        epoch_aug = {"strategy": "within_class_mixup", "alpha": a}
+        row = _run_and_log(
+            exp_name,
+            lambda ea=epoch_aug: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, train_config,
+                epoch_aug_config=ea, seed=seed,
+            ),
+            extra={"group": "H", "subgroup": "within_class_mixup", "wcm_alpha": a},
+        )
+        results.append(row)
+
+    # Part H6: Combined strategies = 12
+    logger.info("--- Part H6: Combined augmentation (12 experiments) ---")
+    combined_configs = [
+        {"name": "DC05+FroFA01", "pretrain": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}, "epoch": {"strategy": "frofa", "strength": 0.1}},
+        {"name": "DC03+FroFA01", "pretrain": {"strategy": "dc", "alpha": 0.3, "n_synthetic": 100}, "epoch": {"strategy": "frofa", "strength": 0.1}},
+        {"name": "DC05+FroFA005", "pretrain": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}, "epoch": {"strategy": "frofa", "strength": 0.05}},
+        {"name": "DC07+FroFA01", "pretrain": {"strategy": "dc", "alpha": 0.7, "n_synthetic": 30}, "epoch": {"strategy": "frofa", "strength": 0.1}},
+        {"name": "DC05+AdaptN01", "pretrain": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}, "epoch": {"strategy": "adaptive_noise", "scale": 0.1}},
+        {"name": "DC05+WCMixup03", "pretrain": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}, "epoch": {"strategy": "within_class_mixup", "alpha": 0.3}},
+        {"name": "SMOTE5+FroFA01", "pretrain": {"strategy": "smote", "k": 5, "n_synthetic": 30}, "epoch": {"strategy": "frofa", "strength": 0.1}},
+        {"name": "SMOTE5+FroFA005", "pretrain": {"strategy": "smote", "k": 5, "n_synthetic": 30}, "epoch": {"strategy": "frofa", "strength": 0.05}},
+        {"name": "SMOTE3+AdaptN01", "pretrain": {"strategy": "smote", "k": 3, "n_synthetic": 50}, "epoch": {"strategy": "adaptive_noise", "scale": 0.1}},
+        {"name": "SMOTE5+WCMixup03", "pretrain": {"strategy": "smote", "k": 5, "n_synthetic": 30}, "epoch": {"strategy": "within_class_mixup", "alpha": 0.3}},
+        {"name": "DC05+FroFA02", "pretrain": {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}, "epoch": {"strategy": "frofa", "strength": 0.2}},
+        {"name": "DC10+FroFA01", "pretrain": {"strategy": "dc", "alpha": 1.0, "n_synthetic": 50}, "epoch": {"strategy": "frofa", "strength": 0.1}},
+    ]
+    for combo in combined_configs:
+        exp_idx += 1
+        exp_name = combo["name"]
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        row = _run_and_log(
+            exp_name,
+            lambda pa=combo["pretrain"], ea=combo["epoch"]: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, train_config,
+                pretrain_aug_config=pa, epoch_aug_config=ea, seed=seed,
+            ),
+            extra={"group": "H", "subgroup": "combined"},
+        )
+        results.append(row)
+
+    # Part H7: Legacy augmentations = 10
+    logger.info("--- Part H7: Legacy augmentations (10 experiments) ---")
+    legacy_configs = [
+        {"name": "GaussNoise_s001", "epoch_aug": {"gaussian_noise_sigma": 0.01}},
+        {"name": "GaussNoise_s005", "epoch_aug": {"gaussian_noise_sigma": 0.05}},
+        {"name": "GaussNoise_s01", "epoch_aug": {"gaussian_noise_sigma": 0.1}},
+        {"name": "GaussNoise_s02", "epoch_aug": {"gaussian_noise_sigma": 0.2}},
+        {"name": "Mixup_a02", "epoch_aug": {"mixup_alpha": 0.2}},
+        {"name": "Mixup_a05", "epoch_aug": {"mixup_alpha": 0.5}},
+        {"name": "Mixup_a10", "epoch_aug": {"mixup_alpha": 1.0}},
+        {"name": "ChDrop_p01", "epoch_aug": {"channel_drop_p": 0.1, "n_channels": 3, "embed_per_channel": embed_dim // 3}},
+        {"name": "ChDrop_p02", "epoch_aug": {"channel_drop_p": 0.2, "n_channels": 3, "embed_per_channel": embed_dim // 3}},
+        {"name": "ChDrop_p03", "epoch_aug": {"channel_drop_p": 0.3, "n_channels": 3, "embed_per_channel": embed_dim // 3}},
+    ]
+    for lcfg in legacy_configs:
+        exp_idx += 1
+        exp_name = lcfg["name"]
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        row = _run_and_log(
+            exp_name,
+            lambda ea=lcfg["epoch_aug"]: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, train_config,
+                epoch_aug_config=ea, seed=seed,
+            ),
+            extra={"group": "H", "subgroup": "legacy"},
+        )
+        results.append(row)
+
+    _save_group_results(results, "H", "group_h_aug_deep", output_dir)
+    return results
+
+
+# ============================================================================
+# Group I: TTA + Ensemble + Final (68 experiments)
+# ============================================================================
+
+def run_group_i(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    Z_test: np.ndarray,
+    y_test: np.ndarray,
+    train_config: TrainConfig,
+    seed: int,
+    output_dir: Path,
+) -> list[dict]:
+    """TTA sweep, multi-seed ensemble, hybrid, sklearn baselines.
+
+    ~68 experiments.
+    """
+    logger.info("=" * 70)
+    logger.info("GROUP I: TTA + Ensemble + Final (~68 experiments)")
+    logger.info("=" * 70)
+
+    embed_dim = Z_train.shape[1]
+    n_classes = len(set(y_train.tolist()) | set(y_test.tolist()))
+    results = []
+    exp_idx = 0
+
+    def default_head_factory():
+        return build_head("mlp", embed_dim, n_classes, hidden_dims=[64], dropout=0.5)
+
+    # Part I1: TTA sweep = 24
+    logger.info("--- Part I1: TTA sweep (24 experiments) ---")
+    tta_ks = [3, 5, 10, 20]
+    tta_strategies = ["frofa", "adaptive_noise"]
+    tta_strengths = [0.05, 0.1, 0.2]
+
+    for k in tta_ks:
+        for strat in tta_strategies:
+            for strength in tta_strengths:
+                exp_idx += 1
+                exp_name = f"TTA-{k}_{strat}_s{strength}"
+                logger.info("[%d] %s", exp_idx, exp_name)
+
+                row = _run_and_log(
+                    exp_name,
+                    lambda k_=k, s_=strat, st_=strength: run_tta_train_test(
+                        Z_train, y_train, Z_test, y_test,
+                        default_head_factory, train_config,
+                        tta_k=k_, tta_strategy=s_, tta_strength=st_, seed=seed,
+                    ),
+                    extra={"group": "I", "subgroup": "tta", "tta_k": k,
+                           "tta_strategy": strat, "tta_strength": strength},
+                )
+                results.append(row)
+
+    # Part I2: Multi-seed ensemble = 8
+    logger.info("--- Part I2: Multi-seed ensemble (8 experiments) ---")
+    for n_seeds in [3, 5, 7, 10, 15, 20]:
+        exp_idx += 1
+        exp_name = f"Ensemble_{n_seeds}seed"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        row = _run_and_log(
+            exp_name,
+            lambda ns=n_seeds: run_ensemble_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, train_config,
+                n_seeds=ns, base_seed=seed,
+            ),
+            extra={"group": "I", "subgroup": "ensemble", "n_seeds": n_seeds},
+        )
+        results.append(row)
+
+    # Ensemble + DC augmentation
+    for n_seeds in [5, 10]:
+        exp_idx += 1
+        exp_name = f"Ensemble_{n_seeds}seed+DC"
+        logger.info("[%d] %s", exp_idx, exp_name)
+        pretrain_aug = {"strategy": "dc", "alpha": 0.5, "n_synthetic": 50}
+
+        row = _run_and_log(
+            exp_name,
+            lambda ns=n_seeds, pa=pretrain_aug: run_ensemble_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, train_config,
+                n_seeds=ns, base_seed=seed, pretrain_aug_config=pa,
+            ),
+            extra={"group": "I", "subgroup": "ensemble_aug", "n_seeds": n_seeds},
+        )
+        results.append(row)
+
+    # Part I3: Multi-seed stability (same config, different seeds) = 15
+    logger.info("--- Part I3: Multi-seed stability (15 experiments) ---")
+    stability_configs = [
+        ("MLP[64]-d0.5", "mlp", {"hidden_dims": [64], "dropout": 0.5}),
+        ("Linear", "linear", {}),
+        ("MLP[128,64]-d0.5", "mlp", {"hidden_dims": [128, 64], "dropout": 0.5}),
+    ]
+    for cfg_name, head_type, head_kwargs in stability_configs:
+        for seed_offset in range(5):
+            exp_idx += 1
+            s = seed + seed_offset * 100
+            exp_name = f"stability_{cfg_name}_seed{s}"
+            logger.info("[%d] %s", exp_idx, exp_name)
 
             def head_factory(ht=head_type, kw=head_kwargs):
                 return build_head(ht, embed_dim, n_classes, **kw)
 
-            metrics, _, _ = run_neural_train_test(
-                Z_train, y_train, Z_test, y_test,
-                head_factory, tc,
-                pretrain_aug_config=best_pretrain,
-                epoch_aug_config=best_epoch,
-                seed=seed,
+            row = _run_and_log(
+                exp_name,
+                lambda hf=head_factory, s_=s: run_neural_train_test(
+                    Z_train, y_train, Z_test, y_test,
+                    hf, train_config, seed=s_,
+                ),
+                extra={"group": "I", "subgroup": "stability",
+                       "config": cfg_name, "seed": s},
             )
-            elapsed = time.time() - t0
-
-            row = _make_result_row(exp_name, metrics, elapsed, extra={
-                "group": "C", "subgroup": "ep_patience",
-                "epochs": ep_cfg["epochs"],
-                "patience": ep_cfg["patience"],
-            })
             results.append(row)
-            logger.info("    Acc=%.4f  F1=%.4f  (%.1fs)", metrics.accuracy, metrics.f1, elapsed)
-        except Exception as e:
-            logger.error("    FAILED: %s", e)
-            results.append({"group": "C", "name": exp_name, "error": str(e)})
 
-    # Save
-    df = pd.DataFrame(results)
-    tables_dir = output_dir / "tables"
-    tables_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(tables_dir / "group_c_training_tta.csv", index=False)
-    logger.info("Saved: %s (%d rows)", tables_dir / "group_c_training_tta.csv", len(df))
+    # Part I4: Sklearn baselines = 6
+    logger.info("--- Part I4: Sklearn baselines (6 experiments) ---")
+    sklearn_baselines = [
+        {"name": "SVM_rbf_default", "config": {"type": "svm", "kernel": "rbf", "C": 1.0}},
+        {"name": "SVM_rbf_C10_g0001", "config": {"type": "svm", "kernel": "rbf", "C": 10.0, "gamma": 0.0001}},
+        {"name": "RF", "config": {"type": "random_forest"}},
+        {"name": "LogReg", "config": {"type": "logistic_regression"}},
+        {"name": "ExtraTrees", "config": {"type": "extra_trees"}},
+        {"name": "GradBoost", "config": {"type": "gradient_boosting"}},
+    ]
+    for clf in sklearn_baselines:
+        exp_idx += 1
+        exp_name = f"sklearn_{clf['name']}"
+        logger.info("[%d] %s", exp_idx, exp_name)
 
+        row = _run_and_log(
+            exp_name,
+            lambda cc=clf["config"]: run_sklearn_train_test(
+                Z_train, y_train, Z_test, y_test, cc,
+            ),
+            extra={"group": "I", "subgroup": "sklearn_baseline", "classifier": clf["name"]},
+        )
+        results.append(row)
+
+    # Part I5: Class-weight experiments = 3
+    logger.info("--- Part I5: Class weight (3 experiments) ---")
+    for cw_name, cw in [("balanced", None), ("1:2", [1.0, 2.0]), ("2:1", [2.0, 1.0])]:
+        exp_idx += 1
+        exp_name = f"ClassWeight_{cw_name}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        tc = TrainConfig(
+            epochs=train_config.epochs,
+            lr=train_config.lr, weight_decay=train_config.weight_decay,
+            early_stopping_patience=train_config.early_stopping_patience,
+            device=train_config.device,
+            class_weight=cw,
+        )
+        row = _run_and_log(
+            exp_name,
+            lambda tc_=tc: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, tc_, seed=seed,
+            ),
+            extra={"group": "I", "subgroup": "class_weight", "class_weight": cw_name},
+        )
+        results.append(row)
+
+    _save_group_results(results, "I", "group_i_tta_ensemble", output_dir)
     return results
 
 
@@ -1129,43 +1768,65 @@ def run_group_c(
 # Summary + Visualization
 # ============================================================================
 
+def _save_group_results(results: list[dict], group: str, filename: str, output_dir: Path):
+    """Save group results to CSV."""
+    df = pd.DataFrame(results)
+    tables_dir = output_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = tables_dir / f"{filename}.csv"
+    df.to_csv(csv_path, index=False)
+    logger.info("Saved: %s (%d rows)", csv_path, len(df))
+
+
 def generate_summary(all_results: list[dict], output_dir: Path):
-    """Generate combined ranking and summary report."""
+    """Generate combined ranking (AUC-primary) and summary report."""
     df = pd.DataFrame(all_results)
-    valid = df.dropna(subset=["accuracy"]) if "accuracy" in df.columns else df
+    valid = df.dropna(subset=["auc"]) if "auc" in df.columns else df
     if len(valid) == 0:
         logger.warning("No valid results to summarize")
         return
 
-    ranked = valid.sort_values("accuracy", ascending=False).head(20)
+    ranked = valid.sort_values("auc", ascending=False).head(30)
 
     tables_dir = output_dir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
-    ranked.to_csv(tables_dir / "top20_ranking.csv", index=False)
+    ranked.to_csv(tables_dir / "top30_ranking.csv", index=False)
 
     logger.info("")
     logger.info("=" * 70)
-    logger.info("TOP 20 CONFIGURATIONS:")
+    logger.info("TOP 30 CONFIGURATIONS (AUC-primary):")
     logger.info("=" * 70)
     for i, (_, row) in enumerate(ranked.iterrows()):
         group = row.get("group", "?")
         name = row.get("name", "?")
+        auc = row.get("auc", 0) or 0
+        eer = row.get("eer", 0) or 0
         acc = row.get("accuracy", 0)
         f1_val = row.get("f1", 0)
-        auc_val = row.get("auc", 0) or 0
         logger.info(
-            "  #%2d [%s] %s: Acc=%.4f F1=%.4f AUC=%.4f",
-            i + 1, group, name, acc, f1_val, auc_val,
+            "  #%2d [%s] %s: AUC=%.4f EER=%.4f Acc=%.4f F1=%.4f",
+            i + 1, group, name, auc, eer, acc, f1_val,
         )
 
     # Save summary JSON
     reports_dir = output_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
+
+    per_group = {}
+    for g in valid["group"].unique() if "group" in valid.columns else []:
+        g_df = valid[valid["group"] == g].sort_values("auc", ascending=False)
+        per_group[g] = {
+            "count": len(g_df),
+            "best": g_df.head(1).to_dict("records")[0] if len(g_df) > 0 else None,
+        }
+
     summary = {
         "total_experiments": len(all_results),
         "successful": len(valid),
         "failed": len(all_results) - len(valid),
-        "top5": ranked.head(5).to_dict("records"),
+        "svm_baseline_auc": 0.9859,
+        "top10": ranked.head(10).to_dict("records"),
+        "per_group": per_group,
     }
     with open(reports_dir / "phase2_summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
@@ -1173,30 +1834,32 @@ def generate_summary(all_results: list[dict], output_dir: Path):
 
 
 def plot_group_bar(results: list[dict], title: str, output_path: Path):
-    """Horizontal bar chart of accuracy for a group of results."""
+    """Horizontal bar chart of AUC for a group of results."""
     setup_style()
-    valid = [r for r in results if "accuracy" in r and r.get("error") is None]
+    valid = [r for r in results if r.get("auc") is not None and r.get("error") is None]
     if not valid:
         return
 
-    valid.sort(key=lambda r: r["accuracy"], reverse=True)
-    names = [r["name"] for r in valid[:20]]  # Top 20
-    accs = [r["accuracy"] for r in valid[:20]]
+    valid.sort(key=lambda r: r["auc"], reverse=True)
+    top = valid[:25]
+    names = [r["name"] for r in top]
+    aucs = [r["auc"] for r in top]
 
-    fig, ax = plt.subplots(figsize=(max(8, len(names) * 0.4), max(5, len(names) * 0.3)))
+    fig, ax = plt.subplots(figsize=(max(10, len(names) * 0.4), max(6, len(names) * 0.3)))
     colors = ["#DE8F05" if i == 0 else "#0173B2" for i in range(len(names))]
-    bars = ax.barh(range(len(names)), accs, color=colors)
+    bars = ax.barh(range(len(names)), aucs, color=colors)
 
     ax.set_yticks(range(len(names)))
     ax.set_yticklabels(names, fontsize=7)
-    ax.set_xlabel("Accuracy")
+    ax.set_xlabel("AUC")
     ax.set_title(title)
-    ax.set_xlim(0, 1.0)
+    ax.axvline(x=0.9859, color="red", linestyle="--", linewidth=1, label="SVM baseline (0.9859)")
+    ax.legend(fontsize=8)
     ax.invert_yaxis()
 
-    for bar, val in zip(bars, accs):
+    for bar, val in zip(bars, aucs):
         ax.text(
-            bar.get_width() + 0.005, bar.get_y() + bar.get_height() / 2,
+            bar.get_width() + 0.002, bar.get_y() + bar.get_height() / 2,
             f"{val:.4f}", va="center", fontsize=7,
         )
 
@@ -1218,13 +1881,13 @@ def load_config(config_path: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Phase 2 Comprehensive Sweep")
     parser.add_argument("--config", required=True, help="YAML config path")
-    parser.add_argument("--group", choices=["A", "B", "C"], default=None,
-                        help="Run specific group only (A, B, or C)")
+    parser.add_argument("--group", choices=["D", "E", "F", "G", "H", "I"], default=None,
+                        help="Run specific group only (D-I)")
     parser.add_argument("--device", default="cuda", help="Device (cuda or cpu)")
     parser.add_argument("--split-date", default=None,
                         help="Override train/test split date (YYYY-MM-DD)")
     parser.add_argument("--layer", type=int, default=None,
-                        help="Primary transformer layer (default: from config or 3)")
+                        help="Primary transformer layer (default: from config)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed (default: from config or 42)")
     args = parser.parse_args()
@@ -1250,47 +1913,17 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     configure_output(formats=["png"], dpi=200)
 
-    # Load data
+    # Data config
     split_date = cfg.get("split_date", "2026-02-15")
-    default_channels = cfg.get("default_channels", ["d620900d_motionSensor", "408981c2_contactSensor"])
+    default_channels = cfg.get("default_channels", [
+        "d620900d_motionSensor", "408981c2_contactSensor",
+        "d620900d_temperatureMeasurement",
+    ])
 
-    # Dataset config from Phase 1 best (or config defaults)
-    ctx_before = cfg.get("default_context_before", 120)
-    ctx_after = cfg.get("default_context_after", 120)
-
-    ds_config = DatasetConfig(
-        context_mode="bidirectional",
-        context_before=ctx_before,
-        context_after=ctx_after,
-        stride=cfg.get("stride", 1),
-    )
-
-    prep_cfg = PreprocessConfig(
-        sensor_csv=cfg["data"]["sensor_csv"],
-        label_csv=cfg["data"]["label_csv"],
-        label_format="events",
-        initial_occupancy=cfg["data"].get("initial_occupancy", 0),
-        binarize=True,
-        channels=default_channels,
-    )
-
-    logger.info("Loading data...")
-    sensor_arr, train_labels, test_labels, ch_names, timestamps = (
-        load_occupancy_data(prep_cfg, split_date=split_date)
-    )
-
-    all_labels = np.where(train_labels >= 0, train_labels, test_labels)
-    dataset = OccupancyDataset(sensor_arr, all_labels, timestamps, ds_config)
-    train_mask, test_mask = dataset.get_train_test_split(split_date)
-
-    n_train = int(train_mask.sum())
-    n_test = int(test_mask.sum())
-    logger.info("Dataset: %d total, %d train, %d test", len(dataset), n_train, n_test)
-
-    # Model config
-    pretrained = cfg["model"]["pretrained_name"]
-    output_token = cfg["model"].get("output_token", "combined")
+    ctx_before = cfg.get("default_context_before", 125)
+    ctx_after = cfg.get("default_context_after", 125)
     primary_layer = args.layer if args.layer is not None else cfg.get("default_layer", 2)
+    stride = cfg.get("stride", 1)
 
     # Training config
     train_raw = cfg.get("training", {})
@@ -1303,104 +1936,153 @@ def main():
         device=device,
     )
 
-    # Extract embeddings
-    groups = [args.group] if args.group else ["A", "B", "C"]
+    # Model config
+    pretrained = cfg["model"]["pretrained_name"]
+    output_token = cfg["model"].get("output_token", "combined")
 
-    # Determine which layers to extract
-    layers_needed = {primary_layer}
-    if "B" in groups:
-        layers_needed.update(ALL_LAYERS)
+    groups = [args.group] if args.group else ["D", "E", "F", "G", "H", "I"]
 
-    all_Z = {}
-    for l in sorted(layers_needed):
-        logger.info("Extracting L%d embeddings...", l)
-        trainer = load_mantis_model(pretrained, l, output_token, device)
-        Z = extract_embeddings(trainer, dataset, device)
-        all_Z[l] = Z
-        del trainer
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    logger.info("=" * 70)
+    logger.info("Phase 2 Comprehensive Sweep")
+    logger.info("  Groups: %s", groups)
+    logger.info("  Channels: %s", default_channels)
+    logger.info("  Context: %d+1+%d = %dmin", ctx_before, ctx_after, ctx_before + 1 + ctx_after)
+    logger.info("  Layer: L%d", primary_layer)
+    logger.info("  Device: %s", device)
+    logger.info("  Seed: %d", seed)
+    logger.info("=" * 70)
 
-    # Split embeddings into train/test
-    y_all = dataset.labels
-    all_Z_train = {l: Z[train_mask] for l, Z in all_Z.items()}
-    all_Z_test = {l: Z[test_mask] for l, Z in all_Z.items()}
-    y_train = y_all[train_mask]
-    y_test = y_all[test_mask]
+    # --- Load data for non-E groups ---
+    needs_default_data = any(g in groups for g in ["D", "F", "G", "H", "I"])
 
-    Z_train_primary = all_Z_train[primary_layer]
-    Z_test_primary = all_Z_test[primary_layer]
+    if needs_default_data:
+        logger.info("Loading data with default channels...")
+        ds_config = DatasetConfig(
+            context_mode="bidirectional",
+            context_before=ctx_before,
+            context_after=ctx_after,
+            stride=stride,
+        )
 
-    logger.info("Primary embeddings (L%d): train=%s, test=%s",
-                primary_layer, Z_train_primary.shape, Z_test_primary.shape)
+        prep_cfg = PreprocessConfig(
+            sensor_csv=cfg["data"]["sensor_csv"],
+            label_csv=cfg["data"]["label_csv"],
+            label_format="events",
+            initial_occupancy=cfg["data"].get("initial_occupancy", 0),
+            binarize=True,
+            channels=default_channels,
+        )
 
-    # Default best aug/head (will be updated by Group A results)
-    best_aug = {"pretrain_aug": None, "epoch_aug": None}
-    best_head_cfg = {"type": "mlp", "kwargs": {"hidden_dims": [64], "dropout": 0.5}}
+        sensor_arr, train_labels, test_labels, ch_names, timestamps = (
+            load_occupancy_data(prep_cfg, split_date=split_date)
+        )
+        all_labels = np.where(train_labels >= 0, train_labels, test_labels)
+        dataset = OccupancyDataset(sensor_arr, all_labels, timestamps, ds_config)
+        train_mask, test_mask = dataset.get_train_test_split(split_date)
 
+        n_train = int(train_mask.sum())
+        n_test = int(test_mask.sum())
+        logger.info("Dataset: %d total, %d train, %d test", len(dataset), n_train, n_test)
+
+        # Determine which layers to extract
+        layers_needed = {primary_layer}
+        if "F" in groups:
+            layers_needed.update(ALL_LAYERS)
+
+        all_Z = {}
+        for l in sorted(layers_needed):
+            logger.info("Extracting L%d embeddings...", l)
+            model = load_mantis_model(pretrained, l, output_token, device)
+            all_Z[l] = extract_embeddings(model, dataset, device)
+            logger.info("  L%d shape: %s", l, all_Z[l].shape)
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+        all_Z_train = {l: Z[train_mask] for l, Z in all_Z.items()}
+        all_Z_test = {l: Z[test_mask] for l, Z in all_Z.items()}
+        y_all = dataset.labels
+        y_train = y_all[train_mask]
+        y_test = y_all[test_mask]
+
+        Z_train_primary = all_Z_train[primary_layer]
+        Z_test_primary = all_Z_test[primary_layer]
+
+        logger.info("Primary embeddings (L%d): train=%s, test=%s",
+                     primary_layer, Z_train_primary.shape, Z_test_primary.shape)
+
+    # --- Run groups ---
     t_start = time.time()
     all_results = []
 
-    # Run groups
     for group in groups:
-        if group == "A":
-            results = run_group_a(
+        logger.info("")
+        t_group = time.time()
+
+        if group == "D":
+            results = run_group_d(
                 Z_train_primary, y_train, Z_test_primary, y_test,
                 base_train_config, seed, output_dir,
             )
-            all_results.extend(results)
-
-            # Update best aug + head from Group A top result
-            valid_a = [r for r in results if "accuracy" in r and r.get("error") is None]
-            if valid_a:
-                valid_a.sort(key=lambda r: -r["accuracy"])
-                top = valid_a[0]
-                aug_name = top.get("augmentation", "no aug")
-                for acfg in AUGMENTATION_CONFIGS:
-                    if acfg["name"] == aug_name:
-                        best_aug = {"pretrain_aug": acfg["pretrain_aug"], "epoch_aug": acfg["epoch_aug"]}
-                        break
-                head_name = top.get("head", "MLP[64]-d0.5")
-                for hcfg in HEAD_CONFIGS:
-                    if hcfg["name"] == head_name:
-                        best_head_cfg = {"type": hcfg["type"], "kwargs": hcfg["kwargs"]}
-                        break
-
-            try:
-                plot_group_bar(results, "Group A: Augmentation × Head", output_dir / "plots" / "group_a_bar")
-            except Exception:
-                logger.warning("Failed to plot Group A bar", exc_info=True)
-
-        elif group == "B":
-            results = run_group_b(
+        elif group == "E":
+            results = run_group_e(
+                sensor_csv=cfg["data"]["sensor_csv"],
+                label_csv=cfg["data"]["label_csv"],
+                initial_occupancy=cfg["data"].get("initial_occupancy", 0),
+                split_date=split_date,
+                stride=stride,
+                pretrained=pretrained,
+                output_token=output_token,
+                primary_layer=primary_layer,
+                train_config=base_train_config,
+                seed=seed,
+                output_dir=output_dir,
+            )
+        elif group == "F":
+            results = run_group_f(
                 all_Z_train, all_Z_test, y_train, y_test,
-                base_train_config, best_aug, seed, output_dir,
+                base_train_config, seed, output_dir,
             )
-            all_results.extend(results)
-
-            try:
-                plot_group_bar(results, "Group B: Layer Selection & Fusion", output_dir / "plots" / "group_b_bar")
-            except Exception:
-                logger.warning("Failed to plot Group B bar", exc_info=True)
-
-        elif group == "C":
-            results = run_group_c(
+        elif group == "G":
+            results = run_group_g(
                 Z_train_primary, y_train, Z_test_primary, y_test,
-                base_train_config, best_aug, best_head_cfg, seed, output_dir,
+                base_train_config, seed, output_dir,
             )
-            all_results.extend(results)
+        elif group == "H":
+            results = run_group_h(
+                Z_train_primary, y_train, Z_test_primary, y_test,
+                base_train_config, seed, output_dir,
+            )
+        elif group == "I":
+            results = run_group_i(
+                Z_train_primary, y_train, Z_test_primary, y_test,
+                base_train_config, seed, output_dir,
+            )
+        else:
+            continue
 
-            try:
-                plot_group_bar(results, "Group C: Training + TTA + Ensemble", output_dir / "plots" / "group_c_bar")
-            except Exception:
-                logger.warning("Failed to plot Group C bar", exc_info=True)
+        all_results.extend(results)
+        group_time = time.time() - t_group
+        logger.info("Group %s completed: %d experiments in %.1fs (%.1f min)",
+                     group, len(results), group_time, group_time / 60)
+
+        try:
+            plot_group_bar(
+                results,
+                f"Group {group}: AUC Ranking",
+                output_dir / "plots" / f"group_{group.lower()}_bar",
+            )
+        except Exception:
+            logger.warning("Failed to plot Group %s bar", group, exc_info=True)
 
     generate_summary(all_results, output_dir)
 
     total_time = time.time() - t_start
     logger.info("")
     logger.info("=" * 70)
-    logger.info("Done! Total time: %.1fs (%.1f min)", total_time, total_time / 60)
+    logger.info("Done! Total: %d experiments in %.1fs (%.1f min)",
+                len(all_results), total_time, total_time / 60)
     logger.info("Output directory: %s", output_dir)
     logger.info("=" * 70)
 

@@ -1,22 +1,28 @@
-# Phase 2 Comprehensive Sweep: MantisV2 Frozen Embeddings + Neural Classification Heads
+# Phase 2 Neural Classification Head Sweep: MantisV2 Frozen Embeddings
 #
-# Updated after Phase 1 findings:
-#   - Context window is the dominant factor → default to 241min (120+1+120)
-#   - L2 is best layer → default to L2
+# Updated after Phase 1.5 exhaustive findings (1,368 experiments):
+#   - Best channels: M+C+T1 (3ch) — dominant over M+C (2ch)
+#   - Best context: 251min bidirectional (125+1+125) — sweet spot 221-311min
+#   - Best layer: L2 (single), L2+L5 (fusion)
+#   - Best sklearn baseline: SVM_rbf → AUC=0.9859, EER=0.0470, Acc=0.9509
 #   - Only output_token="combined" works in MantisV2
 #
-# 3 parallel sweep groups (A/B/C) for optimal neural head configuration.
+# 6 parallel sweep groups (D/E/F/G/H/I) for comprehensive neural head optimization.
+# Total: ~524 experiments across augmentation, architecture, training, and ensembling.
 #
 # Usage:
 #   cd examples/classification/apc_occupancy
 #
-#   # All groups (sequential, ~6-10h)
+#   # All groups (sequential, ~12-24h)
 #   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --device cuda
 #
-#   # Single group (parallel GPU servers)
-#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group A --device cuda
-#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group B --device cuda
-#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group C --device cuda
+#   # Single group on parallel GPU servers
+#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group D --device cuda
+#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group E --device cuda
+#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group F --device cuda
+#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group G --device cuda
+#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group H --device cuda
+#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group I --device cuda
 
 seed: 42
 output_dir: results/phase2_sweep
@@ -35,15 +41,16 @@ data:
   initial_occupancy: 0
   binarize: true
 
-# --- Defaults (updated from Phase 1 best: 241min context, L2) ---
+# --- Defaults (updated from Phase 1.5 best: M+C+T1, 251min, L2) ---
 default_channels:
   - d620900d_motionSensor
   - 408981c2_contactSensor
+  - d620900d_temperatureMeasurement
 
-# Updated: 120+1+120 = 241min context (was 4+1+4 = 9min)
-default_context_before: 120
-default_context_after: 120
-# Updated: L2 (was L3)
+# Phase 1.5 optimal: 125+1+125 = 251min bidirectional context
+default_context_before: 125
+default_context_after: 125
+# Phase 1.5 best single layer
 default_layer: 2
 stride: 1
 
@@ -54,3 +61,8 @@ training:
   weight_decay: 0.01
   label_smoothing: 0.0
   early_stopping_patience: 30
+
+# --- Phase 1.5 Reference (SVM baseline to beat) ---
+# SVM_rbf: AUC=0.9859, EER=0.0470, Acc=0.9509
+# LogReg: AUC=0.9838, EER=0.0598, Acc=0.9463
+# ExtraTrees: AUC=0.9700, EER=0.0827, Acc=0.9352
