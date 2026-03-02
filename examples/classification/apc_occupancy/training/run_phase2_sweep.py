@@ -1,62 +1,76 @@
 #!/usr/bin/env python3
 """Phase 2 Comprehensive Sweep: Neural Classification Heads on MantisV2 Frozen Embeddings.
 
-Updated with Phase 1.5 optimal defaults (SVM baseline to beat):
-  - M+C+T1 channels (3ch) -> AUC=0.9859
-  - 251min bidirectional context (125+1+125)
-  - L2 layer (best single layer)
-  - SVM_rbf AUC=0.9859, EER=0.0470, Acc=0.9509
+v3: Uses label-embedded CSVs from prepare_split.py.
+Split at midnight Feb 16 (optimal class balance ~48:52 in both sets).
+Labels computed globally across full timeline, embedded in each CSV.
+No data leakage — each CSV is physically separated.
 
-Six sweep groups (run independently on 6 parallel GPU servers):
+Phase 1 findings (to beat):
+  - Best channels: M+C+T1 (3ch) — dominant over M+C (2ch)
+  - Best context: ~251min bidirectional (125+1+125) — sweet spot 221-311min
+  - Best layer: L2 (single), L2+L5 (fusion)
+  - Best sklearn: SVM_rbf → AUC≈0.986, EER≈0.047, Acc≈0.951
+  - Only output_token="combined" works in MantisV2
 
-  Group D -- Augmentation x Head Architecture (120 experiments)
+Six sweep groups reorganized for 3-way parallel execution:
+
+  GPU 1: Group D + E — Augmentation x Head + Context Window (~216 experiments)
+
+  Group D — Augmentation x Head Architecture (120 experiments)
     - 10 augmentation strategies x 12 head architectures
     - Fixed: M+C+T1, 251min, L2
     - Goal: Find best augmentation + head combination
 
-  Group E -- Context Window Exploration (96 experiments)
+  Group E — Context Window Exploration (96 experiments)
     - 12 context sizes x 2 channel configs x 4 classifiers
     - Requires re-extraction per context window
     - Goal: Confirm optimal context window for neural heads
 
-  Group F -- Layer x Fusion Strategy (80 experiments)
+  GPU 2: Group F + G — Layer Fusion + Training Hyperparams (~170 experiments)
+
+  Group F — Layer x Fusion Strategy (80 experiments)
     - 6 single layers x 4 heads + concat + fusion + attention
     - Fixed: M+C+T1, 251min
     - Goal: Optimal layer utilization strategy
 
-  Group G -- Training Hyperparameters (90 experiments)
+  Group G — Training Hyperparameters (90 experiments)
     - LR x WD grid + optimizer/scheduler + label smoothing + epoch/patience
     - Fixed: best defaults
     - Goal: Fine-tune training recipe
 
-  Group H -- Augmentation Deep Dive (70 experiments)
+  GPU 3: Group H + I — Augmentation Deep Dive + TTA/Ensemble (~138 experiments)
+
+  Group H — Augmentation Deep Dive (70 experiments)
     - DC/SMOTE/FroFA/AdaptNoise/Mixup param grids + combined strategies
     - Goal: Systematic augmentation optimization
 
-  Group I -- TTA + Ensemble + Final (68 experiments)
+  Group I — TTA + Ensemble + Final (68 experiments)
     - TTA sweep + multi-seed ensemble + hybrid + sklearn baseline
     - Goal: Inference-time boosting + final comparison vs SVM
 
-Total: ~524 experiments across 6 servers.
+Total: ~524 experiments across 3 GPU servers (6 groups).
 
 Usage:
   cd examples/classification/apc_occupancy
 
-  # Run specific group (one per GPU server)
+  # Run specific group
   python training/run_phase2_sweep.py \\
       --config training/configs/occupancy-phase2.yaml --group D --device cuda
-  python training/run_phase2_sweep.py \\
-      --config training/configs/occupancy-phase2.yaml --group E --device cuda
-  python training/run_phase2_sweep.py \\
-      --config training/configs/occupancy-phase2.yaml --group F --device cuda
-  python training/run_phase2_sweep.py \\
-      --config training/configs/occupancy-phase2.yaml --group G --device cuda
-  python training/run_phase2_sweep.py \\
-      --config training/configs/occupancy-phase2.yaml --group H --device cuda
-  python training/run_phase2_sweep.py \\
-      --config training/configs/occupancy-phase2.yaml --group I --device cuda
 
-  # Run all groups sequentially (single server, ~3-6h)
+  # Run GPU-1 groups (D+E)
+  python training/run_phase2_sweep.py \\
+      --config training/configs/occupancy-phase2.yaml --group D E --device cuda
+
+  # Run GPU-2 groups (F+G)
+  python training/run_phase2_sweep.py \\
+      --config training/configs/occupancy-phase2.yaml --group F G --device cuda
+
+  # Run GPU-3 groups (H+I)
+  python training/run_phase2_sweep.py \\
+      --config training/configs/occupancy-phase2.yaml --group H I --device cuda
+
+  # Run all groups sequentially (single server, ~12-24h)
   python training/run_phase2_sweep.py \\
       --config training/configs/occupancy-phase2.yaml --device cuda
 """
@@ -88,7 +102,7 @@ import matplotlib.pyplot as plt
 # Local imports -- run from apc_occupancy/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from data.preprocess import PreprocessConfig, load_occupancy_data
+from data.preprocess import load_labeled_csv
 from data.dataset import DatasetConfig, OccupancyDataset
 from evaluation.metrics import compute_metrics, compute_wilson_ci, ClassificationMetrics
 from training.heads import build_head
@@ -887,10 +901,9 @@ GROUP_E_CLASSIFIERS = [
 
 
 def run_group_e(
-    sensor_csv: str,
-    label_csv: str,
-    initial_occupancy: int,
-    split_date: str,
+    train_csv: str,
+    test_csv: str,
+    label_column: str,
     stride: int,
     pretrained: str,
     output_token: str,
@@ -902,7 +915,8 @@ def run_group_e(
     """Sweep context windows with neural + sklearn classifiers.
 
     12 contexts x 2 channels x 4 classifiers = 96 experiments.
-    Requires re-extraction per context window.
+    Uses label-embedded CSVs (v3 format). Separate train/test datasets
+    per context window to prevent data leakage.
     """
     logger.info("=" * 70)
     logger.info("GROUP E: Context Window Exploration (96 experiments)")
@@ -919,46 +933,40 @@ def run_group_e(
     exp_idx = 0
 
     for ch_cfg in GROUP_E_CHANNELS:
-        # Load data for this channel set
+        # Load data for this channel set from label-embedded CSVs
         channels = _resolve_channels(ch_cfg["keys"])
         logger.info("Loading data for channels: %s", ch_cfg["name"])
-        prep = PreprocessConfig(
-            sensor_csv=sensor_csv,
-            label_csv=label_csv,
-            label_format="events",
-            initial_occupancy=initial_occupancy,
-            binarize=True,
-            channels=channels,
+
+        train_sensor, train_labels, ch_names, train_ts = load_labeled_csv(
+            train_csv, label_column=label_column, channels=channels,
         )
-        sensor_arr, train_labels, test_labels, _, timestamps = (
-            load_occupancy_data(prep, split_date=split_date)
+        test_sensor, test_labels, _, test_ts = load_labeled_csv(
+            test_csv, label_column=label_column, channels=channels,
         )
-        all_labels = np.where(train_labels >= 0, train_labels, test_labels)
 
         for ctx_cfg in GROUP_E_CONTEXTS:
-            # Build dataset with this context
+            # Build separate train/test datasets with this context
             ds_cfg = DatasetConfig(
                 context_mode="bidirectional",
                 context_before=ctx_cfg["before"],
                 context_after=ctx_cfg["after"],
                 stride=stride,
             )
-            dataset = OccupancyDataset(sensor_arr, all_labels, timestamps, ds_cfg)
-            train_mask, test_mask = dataset.get_train_test_split(split_date)
+            train_dataset = OccupancyDataset(train_sensor, train_labels, train_ts, ds_cfg)
+            test_dataset = OccupancyDataset(test_sensor, test_labels, test_ts, ds_cfg)
 
-            n_train = int(train_mask.sum())
-            n_test = int(test_mask.sum())
+            n_train = len(train_dataset)
+            n_test = len(test_dataset)
             if n_train < 10 or n_test < 10:
                 logger.warning("Skipping %s/%s: train=%d test=%d",
                                ch_cfg["name"], ctx_cfg["name"], n_train, n_test)
                 continue
 
-            # Extract embeddings
-            Z = extract_embeddings(model, dataset, device)
-            Z_train = Z[train_mask]
-            Z_test = Z[test_mask]
-            y_train = dataset.labels[train_mask]
-            y_test = dataset.labels[test_mask]
+            # Extract embeddings separately for train and test
+            Z_train = extract_embeddings(model, train_dataset, device)
+            Z_test = extract_embeddings(model, test_dataset, device)
+            y_train = train_dataset.labels
+            y_test = test_dataset.labels
             embed_dim = Z_train.shape[1]
             n_classes = len(set(y_train.tolist()) | set(y_test.tolist()))
 
@@ -1881,11 +1889,10 @@ def load_config(config_path: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Phase 2 Comprehensive Sweep")
     parser.add_argument("--config", required=True, help="YAML config path")
-    parser.add_argument("--group", choices=["D", "E", "F", "G", "H", "I"], default=None,
-                        help="Run specific group only (D-I)")
+    parser.add_argument("--group", nargs="+",
+                        choices=["D", "E", "F", "G", "H", "I"], default=None,
+                        help="Run specific group(s) (e.g. --group D E for GPU-1)")
     parser.add_argument("--device", default="cuda", help="Device (cuda or cpu)")
-    parser.add_argument("--split-date", default=None,
-                        help="Override train/test split date (YYYY-MM-DD)")
     parser.add_argument("--layer", type=int, default=None,
                         help="Primary transformer layer (default: from config)")
     parser.add_argument("--seed", type=int, default=None,
@@ -1900,8 +1907,6 @@ def main():
     )
 
     cfg = load_config(args.config)
-    if args.split_date is not None:
-        cfg["split_date"] = args.split_date
 
     seed = args.seed if args.seed is not None else cfg.get("seed", 42)
     device = args.device
@@ -1914,7 +1919,8 @@ def main():
     configure_output(formats=["png"], dpi=200)
 
     # Data config
-    split_date = cfg.get("split_date", "2026-02-15")
+    data_cfg = cfg["data"]
+    label_column = data_cfg.get("label_column", "occupancy_label")
     default_channels = cfg.get("default_channels", [
         "d620900d_motionSensor", "408981c2_contactSensor",
         "d620900d_temperatureMeasurement",
@@ -1940,71 +1946,75 @@ def main():
     pretrained = cfg["model"]["pretrained_name"]
     output_token = cfg["model"].get("output_token", "combined")
 
-    groups = [args.group] if args.group else ["D", "E", "F", "G", "H", "I"]
+    groups = args.group if args.group else ["D", "E", "F", "G", "H", "I"]
 
     logger.info("=" * 70)
-    logger.info("Phase 2 Comprehensive Sweep")
+    logger.info("Phase 2 Comprehensive Sweep (v3: label-embedded CSVs)")
     logger.info("  Groups: %s", groups)
     logger.info("  Channels: %s", default_channels)
-    logger.info("  Context: %d+1+%d = %dmin", ctx_before, ctx_after, ctx_before + 1 + ctx_after)
+    logger.info("  Context: %d+1+%d = %dmin (bidirectional)",
+                ctx_before, ctx_after, ctx_before + 1 + ctx_after)
     logger.info("  Layer: L%d", primary_layer)
     logger.info("  Device: %s", device)
     logger.info("  Seed: %d", seed)
     logger.info("=" * 70)
 
-    # --- Load data for non-E groups ---
+    # --- Load data for non-E groups using label-embedded CSVs ---
     needs_default_data = any(g in groups for g in ["D", "F", "G", "H", "I"])
 
     if needs_default_data:
-        logger.info("Loading data with default channels...")
+        logger.info("Loading data with default channels (label-embedded CSVs)...")
+
+        train_sensor, train_labels, ch_names, train_ts = load_labeled_csv(
+            data_cfg["train_csv"], label_column=label_column,
+            channels=default_channels,
+        )
+        test_sensor, test_labels, _, test_ts = load_labeled_csv(
+            data_cfg["test_csv"], label_column=label_column,
+            channels=default_channels,
+        )
+
+        n_train_labeled = (train_labels >= 0).sum()
+        n_test_labeled = (test_labels >= 0).sum()
+        logger.info("Loaded: train=%d rows (%d labeled), test=%d rows (%d labeled)",
+                     len(train_sensor), n_train_labeled,
+                     len(test_sensor), n_test_labeled)
+
+        # Build separate train/test datasets with default context
         ds_config = DatasetConfig(
             context_mode="bidirectional",
             context_before=ctx_before,
             context_after=ctx_after,
             stride=stride,
         )
+        train_dataset = OccupancyDataset(train_sensor, train_labels, train_ts, ds_config)
+        test_dataset = OccupancyDataset(test_sensor, test_labels, test_ts, ds_config)
 
-        prep_cfg = PreprocessConfig(
-            sensor_csv=cfg["data"]["sensor_csv"],
-            label_csv=cfg["data"]["label_csv"],
-            label_format="events",
-            initial_occupancy=cfg["data"].get("initial_occupancy", 0),
-            binarize=True,
-            channels=default_channels,
-        )
-
-        sensor_arr, train_labels, test_labels, ch_names, timestamps = (
-            load_occupancy_data(prep_cfg, split_date=split_date)
-        )
-        all_labels = np.where(train_labels >= 0, train_labels, test_labels)
-        dataset = OccupancyDataset(sensor_arr, all_labels, timestamps, ds_config)
-        train_mask, test_mask = dataset.get_train_test_split(split_date)
-
-        n_train = int(train_mask.sum())
-        n_test = int(test_mask.sum())
-        logger.info("Dataset: %d total, %d train, %d test", len(dataset), n_train, n_test)
+        n_train = len(train_dataset)
+        n_test = len(test_dataset)
+        logger.info("Datasets: train=%d windows, test=%d windows", n_train, n_test)
 
         # Determine which layers to extract
         layers_needed = {primary_layer}
         if "F" in groups:
             layers_needed.update(ALL_LAYERS)
 
-        all_Z = {}
+        all_Z_train = {}
+        all_Z_test = {}
         for l in sorted(layers_needed):
             logger.info("Extracting L%d embeddings...", l)
             model = load_mantis_model(pretrained, l, output_token, device)
-            all_Z[l] = extract_embeddings(model, dataset, device)
-            logger.info("  L%d shape: %s", l, all_Z[l].shape)
+            all_Z_train[l] = extract_embeddings(model, train_dataset, device)
+            all_Z_test[l] = extract_embeddings(model, test_dataset, device)
+            logger.info("  L%d: train=%s, test=%s",
+                        l, all_Z_train[l].shape, all_Z_test[l].shape)
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
 
-        all_Z_train = {l: Z[train_mask] for l, Z in all_Z.items()}
-        all_Z_test = {l: Z[test_mask] for l, Z in all_Z.items()}
-        y_all = dataset.labels
-        y_train = y_all[train_mask]
-        y_test = y_all[test_mask]
+        y_train = train_dataset.labels
+        y_test = test_dataset.labels
 
         Z_train_primary = all_Z_train[primary_layer]
         Z_test_primary = all_Z_test[primary_layer]
@@ -2027,10 +2037,9 @@ def main():
             )
         elif group == "E":
             results = run_group_e(
-                sensor_csv=cfg["data"]["sensor_csv"],
-                label_csv=cfg["data"]["label_csv"],
-                initial_occupancy=cfg["data"].get("initial_occupancy", 0),
-                split_date=split_date,
+                train_csv=data_cfg["train_csv"],
+                test_csv=data_cfg["test_csv"],
+                label_column=label_column,
                 stride=stride,
                 pretrained=pretrained,
                 output_token=output_token,
