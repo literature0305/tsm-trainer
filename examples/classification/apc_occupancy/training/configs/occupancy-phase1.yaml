@@ -60,9 +60,9 @@ default_channels:
   - d620900d_motionSensor
   - 408981c2_contactSensor
 
-# L2 was best at 241min (AUC=0.8391), used as default for Groups A & B
+# L2 was best at 201min (AUC=0.8391), used as default for Groups A & B
 default_layer: 2
-# Default context for groups that don't sweep context
-default_context_before: 120
-default_context_after: 120
+# Default context: 100+1+100 = 201min bidirectional (MAX_CONTEXT_AFTER=100)
+default_context_before: 100
+default_context_after: 100
 stride: 1

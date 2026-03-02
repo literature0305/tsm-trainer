@@ -14,19 +14,20 @@ label leakage prevented via masked label arrays).
 
 Three sweep groups (run independently on separate GPUs):
 
-  Group A — Context Window Deep Exploration (~51 experiments)
-    - 21 symmetric bidirectional + 10 backward-only
-      + 16 asymmetric past-heavy + 4 asymmetric future-heavy
+  Group A — Context Window Deep Exploration (~58 experiments)
+    - 14 symmetric bidirectional (cap 100+1+100) + 10 backward-only
+      + 22 asymmetric past-heavy + 12 future-sensitivity analysis
     - Fixed: L2, RF, M+C channels, combined token
     - Goal: Map full context window landscape, find saturation point
+    - NOTE: Future context capped at MAX_CONTEXT_AFTER=100 (deployment limit)
 
   Group B — Channel Ablation × Context (~63 experiments)
-    - 21 channel combos × 3 context sizes (61min, 121min, 241min)
+    - 21 channel combos × 3 context sizes (61min, 121min, 201min)
     - Fixed: L2, RF, combined token
     - Goal: Check if channel importance varies with context length
 
   Group C — Classifier × Layer at Long Contexts (~54 experiments)
-    - 3 classifiers × 6 layers × 3 contexts (121min, 241min, 361min)
+    - 3 classifiers × 6 layers × 3 contexts (121min, 201min, 341min_asym)
     - Fixed: M+C channels, combined token
     - Goal: Find best classifier and layer at long contexts
 
@@ -83,8 +84,13 @@ logger = logging.getLogger(__name__)
 ALL_LAYERS = [0, 1, 2, 3, 4, 5]
 
 # ── Group A: Context Window Deep Exploration ────────────────────────
-# Subgroup A1: Symmetric Bidirectional (21 configs)
-# Key range: performance scales log-linearly from 1min to 241min+
+# MAX_CONTEXT_AFTER = 100 constraint (from dataset.py):
+#   Future look-ahead is capped at 100 minutes for realistic deployment.
+#   Symmetric windows cap at 100+1+100 = 201 min.
+#   Past context has no upper limit (backward-only can go to 1440+).
+
+# Subgroup A1: Symmetric Bidirectional (14 configs)
+# Capped at 100+1+100 = 201 min.  Measures the value of equal past+future.
 CONTEXT_SYMMETRIC = [
     {"name": "1min (0+1+0)", "context_before": 0, "context_after": 0},
     {"name": "3min (1+1+1)", "context_before": 1, "context_after": 1},
@@ -99,17 +105,11 @@ CONTEXT_SYMMETRIC = [
     {"name": "121min (60+1+60)", "context_before": 60, "context_after": 60},
     {"name": "151min (75+1+75)", "context_before": 75, "context_after": 75},
     {"name": "181min (90+1+90)", "context_before": 90, "context_after": 90},
-    {"name": "241min (120+1+120)", "context_before": 120, "context_after": 120},
-    {"name": "301min (150+1+150)", "context_before": 150, "context_after": 150},
-    {"name": "361min (180+1+180)", "context_before": 180, "context_after": 180},
-    {"name": "481min (240+1+240)", "context_before": 240, "context_after": 240},
-    {"name": "601min (300+1+300)", "context_before": 300, "context_after": 300},
-    {"name": "721min (360+1+360)", "context_before": 360, "context_after": 360},
-    {"name": "961min (480+1+480)", "context_before": 480, "context_after": 480},
-    {"name": "1441min (720+1+720)", "context_before": 720, "context_after": 720},
+    {"name": "201min (100+1+100)", "context_before": 100, "context_after": 100},
 ]
 
 # Subgroup A2: Backward-Only (10 configs) — no future information
+# Pure past context: tests whether future context adds value vs pure history.
 CONTEXT_BACKWARD = [
     {"name": "bw 6min (5+1+0)", "context_before": 5, "context_after": 0},
     {"name": "bw 16min (15+1+0)", "context_before": 15, "context_after": 0},
@@ -123,43 +123,70 @@ CONTEXT_BACKWARD = [
     {"name": "bw 1441min (1440+1+0)", "context_before": 1440, "context_after": 0},
 ]
 
-# Subgroup A3: Asymmetric Past-Heavy (16 configs) — practical deployment
+# Subgroup A3: Asymmetric Past-Heavy (22 configs) — practical deployment
+# Large past + capped future.  Groups by future level: 5, 10, 30, 60, 100.
 CONTEXT_ASYM_PAST = [
+    # future=5: minimal look-ahead, scaling past
     {"name": "asym 30p+5f (30+1+5)", "context_before": 30, "context_after": 5},
     {"name": "asym 60p+5f (60+1+5)", "context_before": 60, "context_after": 5},
-    {"name": "asym 60p+10f (60+1+10)", "context_before": 60, "context_after": 10},
-    {"name": "asym 60p+30f (60+1+30)", "context_before": 60, "context_after": 30},
     {"name": "asym 120p+5f (120+1+5)", "context_before": 120, "context_after": 5},
+    {"name": "asym 240p+5f (240+1+5)", "context_before": 240, "context_after": 5},
+    # future=10: short look-ahead, scaling past
+    {"name": "asym 60p+10f (60+1+10)", "context_before": 60, "context_after": 10},
     {"name": "asym 120p+10f (120+1+10)", "context_before": 120, "context_after": 10},
-    {"name": "asym 120p+30f (120+1+30)", "context_before": 120, "context_after": 30},
-    {"name": "asym 120p+60f (120+1+60)", "context_before": 120, "context_after": 60},
     {"name": "asym 240p+10f (240+1+10)", "context_before": 240, "context_after": 10},
+    {"name": "asym 480p+10f (480+1+10)", "context_before": 480, "context_after": 10},
+    # future=30: moderate look-ahead, scaling past
+    {"name": "asym 60p+30f (60+1+30)", "context_before": 60, "context_after": 30},
+    {"name": "asym 120p+30f (120+1+30)", "context_before": 120, "context_after": 30},
     {"name": "asym 240p+30f (240+1+30)", "context_before": 240, "context_after": 30},
-    {"name": "asym 240p+60f (240+1+60)", "context_before": 240, "context_after": 60},
-    {"name": "asym 240p+120f (240+1+120)", "context_before": 240, "context_after": 120},
     {"name": "asym 360p+30f (360+1+30)", "context_before": 360, "context_after": 30},
+    # future=60: large look-ahead, scaling past
+    {"name": "asym 120p+60f (120+1+60)", "context_before": 120, "context_after": 60},
+    {"name": "asym 240p+60f (240+1+60)", "context_before": 240, "context_after": 60},
     {"name": "asym 360p+60f (360+1+60)", "context_before": 360, "context_after": 60},
     {"name": "asym 480p+60f (480+1+60)", "context_before": 480, "context_after": 60},
     {"name": "asym 720p+60f (720+1+60)", "context_before": 720, "context_after": 60},
+    # future=100: max look-ahead, scaling past — deployment boundary
+    {"name": "asym 120p+100f (120+1+100)", "context_before": 120, "context_after": 100},
+    {"name": "asym 240p+100f (240+1+100)", "context_before": 240, "context_after": 100},
+    {"name": "asym 360p+100f (360+1+100)", "context_before": 360, "context_after": 100},
+    {"name": "asym 480p+100f (480+1+100)", "context_before": 480, "context_after": 100},
+    {"name": "asym 720p+100f (720+1+100)", "context_before": 720, "context_after": 100},
 ]
 
-# Subgroup A4: Asymmetric Future-Heavy (4 configs) — comparison baseline
-CONTEXT_ASYM_FUTURE = [
-    {"name": "asym 5p+30f (5+1+30)", "context_before": 5, "context_after": 30},
-    {"name": "asym 10p+60f (10+1+60)", "context_before": 10, "context_after": 60},
-    {"name": "asym 30p+120f (30+1+120)", "context_before": 30, "context_after": 120},
-    {"name": "asym 60p+240f (60+1+240)", "context_before": 60, "context_after": 240},
+# Subgroup A4: Future Sensitivity Analysis (12 configs)
+# Fixed past, systematically varying future 0→5→10→20→30→60→100.
+# Directly measures marginal value of each additional future minute.
+CONTEXT_FUTURE_SENSITIVITY = [
+    # Series 1: past=60 — moderate history, measure future impact
+    {"name": "fsens 60p+0f (60+1+0)", "context_before": 60, "context_after": 0},
+    {"name": "fsens 60p+5f (60+1+5)", "context_before": 60, "context_after": 5},
+    {"name": "fsens 60p+10f (60+1+10)", "context_before": 60, "context_after": 10},
+    {"name": "fsens 60p+20f (60+1+20)", "context_before": 60, "context_after": 20},
+    {"name": "fsens 60p+30f (60+1+30)", "context_before": 60, "context_after": 30},
+    {"name": "fsens 60p+60f (60+1+60)", "context_before": 60, "context_after": 60},
+    {"name": "fsens 60p+100f (60+1+100)", "context_before": 60, "context_after": 100},
+    # Series 2: past=240 — long history, measure future impact
+    {"name": "fsens 240p+0f (240+1+0)", "context_before": 240, "context_after": 0},
+    {"name": "fsens 240p+10f (240+1+10)", "context_before": 240, "context_after": 10},
+    {"name": "fsens 240p+30f (240+1+30)", "context_before": 240, "context_after": 30},
+    {"name": "fsens 240p+60f (240+1+60)", "context_before": 240, "context_after": 60},
+    {"name": "fsens 240p+100f (240+1+100)", "context_before": 240, "context_after": 100},
 ]
 
-# All context configs for Group A
-ALL_CONTEXT_CONFIGS = CONTEXT_SYMMETRIC + CONTEXT_BACKWARD + CONTEXT_ASYM_PAST + CONTEXT_ASYM_FUTURE
+# All context configs for Group A (58 experiments)
+ALL_CONTEXT_CONFIGS = (
+    CONTEXT_SYMMETRIC + CONTEXT_BACKWARD
+    + CONTEXT_ASYM_PAST + CONTEXT_FUTURE_SENSITIVITY
+)
 
 # ── Group B: Channel Ablation at multiple contexts ──────────────────
-# Test at 3 representative context sizes to check for interaction effects
+# Test at 3 representative context sizes (all ≤ MAX_CONTEXT_AFTER=100)
 GROUP_B_CONTEXTS = [
     {"name": "61min", "context_before": 30, "context_after": 30},
     {"name": "121min", "context_before": 60, "context_after": 60},
-    {"name": "241min", "context_before": 120, "context_after": 120},
+    {"name": "201min", "context_before": 100, "context_after": 100},
 ]
 
 # 21 channel combinations
@@ -195,8 +222,8 @@ CHANNEL_CONFIGS = [
 CLASSIFIER_NAMES = ["random_forest", "svm", "nearest_centroid"]
 GROUP_C_CONTEXTS = [
     {"name": "121min", "context_before": 60, "context_after": 60},
-    {"name": "241min", "context_before": 120, "context_after": 120},
-    {"name": "361min", "context_before": 180, "context_after": 180},
+    {"name": "201min", "context_before": 100, "context_after": 100},
+    {"name": "341min_asym", "context_before": 240, "context_after": 100},
 ]
 
 
@@ -374,9 +401,10 @@ def run_train_test_eval(
 def run_group_a(cfg: dict, device: str, output_dir: Path) -> list[dict]:
     """Deep context window exploration with RF classifier.
 
-    21 symmetric + 10 backward + 16 asym-past + 4 asym-future = 51 configs.
+    14 symmetric + 10 backward + 22 asym-past + 12 future-sens = 58 configs.
     Fixed: L2 (best layer from initial round), RF, M+C, combined token.
-    Uses physically separated train/test sensor CSVs (no data leakage).
+    Future context capped at MAX_CONTEXT_AFTER=100.
+    Uses unified sensor array with date-based label split (no data leakage).
     """
     n_total = len(ALL_CONTEXT_CONFIGS)
     logger.info("=" * 70)
@@ -428,6 +456,8 @@ def run_group_a(cfg: dict, device: str, output_dir: Path) -> list[dict]:
                 subgroup = "backward"
             elif ctx_before == ctx_after:
                 subgroup = "symmetric"
+            elif ctx_name.startswith("fsens"):
+                subgroup = "future_sensitivity"
             elif ctx_before > ctx_after:
                 subgroup = "asym_past"
             else:
@@ -489,7 +519,7 @@ def run_group_a(cfg: dict, device: str, output_dir: Path) -> list[dict]:
 def run_group_b(cfg: dict, device: str, output_dir: Path) -> list[dict]:
     """Channel ablation at multiple context sizes.
 
-    21 channel combos × 3 contexts (61min, 121min, 241min) = 63 experiments.
+    21 channel combos × 3 contexts (61min, 121min, 201min) = 63 experiments.
     Fixed: L2 (best), RF, combined token.
     Goal: Check if channel importance varies with context length.
     Uses unified sensor array — context windows can cross split boundary.
@@ -598,7 +628,7 @@ def run_group_b(cfg: dict, device: str, output_dir: Path) -> list[dict]:
 def run_group_c(cfg: dict, device: str, output_dir: Path) -> list[dict]:
     """Classifier × Layer sweep at long contexts.
 
-    3 classifiers × 6 layers × 3 contexts (121, 241, 361 min) = 54 experiments.
+    3 classifiers × 6 layers × 3 contexts (121, 201, 341_asym min) = 54 experiments.
     Fixed: M+C channels, combined token.
     Goal: Find best classifier/layer at contexts where it matters.
     Uses unified sensor array — context windows can cross split boundary.

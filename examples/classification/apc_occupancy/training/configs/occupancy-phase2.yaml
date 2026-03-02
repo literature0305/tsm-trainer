@@ -9,12 +9,13 @@
 # Default split: Feb 17 (maximize train data, ~73:27 ratio)
 #
 # Phase 1 findings (to update after new sweep):
-#   - Context window is THE dominant factor (AUC: 0.56@1min → 0.84+@241min)
+#   - Context window is THE dominant factor (AUC: 0.56@1min → 0.84+@201min)
 #   - Best channels: M+C+T1 (3ch) — dominant over M+C (2ch)
-#   - Best context: ~251min bidirectional (125+1+125)
+#   - Best context: ~201min bidirectional (100+1+100) — max symmetric
 #   - Best layer: L2 (single), L2+L5 (fusion)
 #   - Best sklearn: SVM_rbf → AUC≈0.986, EER≈0.047, Acc≈0.951
 #   - Only output_token="combined" works in MantisV2
+#   - Future context capped at MAX_CONTEXT_AFTER=100
 #
 # 6 sweep groups (D-I) across 3 GPU servers:
 #   GPU 1: D + E — Augmentation x Head + Context Window (~216 exps)
@@ -60,15 +61,16 @@ data:
 # Override with --split-date CLI arg
 split_date: "2026-02-17"
 
-# --- Defaults (from Phase 1 best: M+C+T1, 251min bidirectional, L2) ---
+# --- Defaults (from Phase 1 best: M+C+T1, 201min bidirectional, L2) ---
+# NOTE: Future context capped at MAX_CONTEXT_AFTER=100 (deployment limit).
 default_channels:
   - d620900d_motionSensor
   - 408981c2_contactSensor
   - d620900d_temperatureMeasurement
 
-# Phase 1 optimal: 125+1+125 = 251min bidirectional context
-default_context_before: 125
-default_context_after: 125
+# Default: 100+1+100 = 201min bidirectional context (max symmetric)
+default_context_before: 100
+default_context_after: 100
 # Phase 1 best single layer
 default_layer: 2
 stride: 1

@@ -40,6 +40,11 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
+# Maximum future context (look-ahead) in minutes.
+# Constraint: real-time deployment scenarios allow at most ~100 min of
+# future information.  Configs requesting more will be rejected.
+MAX_CONTEXT_AFTER = 100
+
 
 @dataclass
 class DatasetConfig:
@@ -121,6 +126,12 @@ class DatasetConfig:
                 raise ValueError(
                     f"context_before and context_after must be >= 0, "
                     f"got before={self.context_before}, after={self.context_after}"
+                )
+            if self.context_after > MAX_CONTEXT_AFTER:
+                raise ValueError(
+                    f"context_after={self.context_after} exceeds "
+                    f"MAX_CONTEXT_AFTER={MAX_CONTEXT_AFTER}. "
+                    f"Real-time deployment limits future look-ahead."
                 )
             eff = self.effective_seq_len
             if self.target_seq_len is None:
@@ -220,16 +231,24 @@ class OccupancyDataset(Dataset):
                 & (labeled_indices + ctx_after < n_timesteps)
             )
             valid_indices = labeled_indices[valid_mask]
-
-            # Count padded windows (boundary events)
-            n_boundary = labeled_mask.sum() - len(valid_indices)
-            # Also include boundary windows with zero-padding
-            all_valid_indices = labeled_indices.copy()
+            n_boundary = int(labeled_mask.sum()) - len(valid_indices)
+            if n_boundary > 0:
+                logger.info(
+                    "Boundary skip: %d/%d labeled timesteps excluded "
+                    "(insufficient context for %d+1+%d window)",
+                    n_boundary, int(labeled_mask.sum()),
+                    ctx_before, ctx_after,
+                )
         else:
             min_idx = config.seq_len - 1
             valid_indices = labeled_indices[labeled_indices >= min_idx]
-            all_valid_indices = valid_indices
-            n_boundary = 0
+            n_boundary = int(labeled_mask.sum()) - len(valid_indices)
+            if n_boundary > 0:
+                logger.info(
+                    "Boundary skip: %d/%d labeled timesteps excluded "
+                    "(insufficient context for seq_len=%d)",
+                    n_boundary, int(labeled_mask.sum()), config.seq_len,
+                )
 
         # Apply stride
         if config.stride > 1:
@@ -241,34 +260,14 @@ class OccupancyDataset(Dataset):
                 f"config={config.describe()}"
             )
 
-        # Pre-extract all windows
+        # Pre-extract all windows (valid_indices guarantees in-bounds)
         windows = []
-        n_padded = 0
 
         if config.context_mode == "bidirectional":
             for idx in valid_indices:
                 start = idx - ctx_before
                 end = idx + ctx_after + 1  # exclusive
-
-                if start >= 0 and end <= n_timesteps:
-                    window = sensor_array[start:end]
-                else:
-                    # Zero-pad boundaries
-                    left_pad = max(0, -start)
-                    right_pad = max(0, end - n_timesteps)
-                    actual_start = max(0, start)
-                    actual_end = min(n_timesteps, end)
-                    available = sensor_array[actual_start:actual_end]
-
-                    parts = []
-                    if left_pad > 0:
-                        parts.append(np.zeros((left_pad, n_channels), dtype=np.float32))
-                    parts.append(available)
-                    if right_pad > 0:
-                        parts.append(np.zeros((right_pad, n_channels), dtype=np.float32))
-                    window = np.concatenate(parts, axis=0)
-                    n_padded += 1
-
+                window = sensor_array[start:end]  # (eff_len, n_channels)
                 windows.append(window.T)  # (n_channels, eff_len)
         else:
             seq_len = config.seq_len
@@ -288,12 +287,6 @@ class OccupancyDataset(Dataset):
         else:
             self.timestamps = None
             self.prediction_timestamps = None
-
-        if n_padded > 0:
-            logger.warning(
-                "%d/%d windows required zero-padding (sensor boundary)",
-                n_padded, len(valid_indices),
-            )
 
         n_occ = (self.labels == 1).sum()
         n_emp = (self.labels == 0).sum()

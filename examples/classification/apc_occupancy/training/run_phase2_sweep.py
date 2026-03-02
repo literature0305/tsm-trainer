@@ -9,10 +9,11 @@ label leakage prevented via masked label arrays).
 
 Phase 1 findings (to beat):
   - Best channels: M+C+T1 (3ch) — dominant over M+C (2ch)
-  - Best context: ~251min bidirectional (125+1+125) — sweet spot 221-311min
+  - Best context: ~201min bidirectional (100+1+100) — max symmetric
   - Best layer: L2 (single), L2+L5 (fusion)
   - Best sklearn: SVM_rbf → AUC≈0.986, EER≈0.047, Acc≈0.951
   - Only output_token="combined" works in MantisV2
+  - NOTE: Future context capped at MAX_CONTEXT_AFTER=100 (deployment limit)
 
 Six sweep groups reorganized for 3-way parallel execution:
 
@@ -950,6 +951,8 @@ def run_group_d(
 # Group E: Context Window Exploration (96 experiments)
 # ============================================================================
 
+# Context configs: symmetric up to 100+1+100, then asymmetric with future=100.
+# MAX_CONTEXT_AFTER = 100 enforced in DatasetConfig.__post_init__.
 GROUP_E_CONTEXTS = [
     {"name": "3min", "before": 1, "after": 1},
     {"name": "11min", "before": 5, "after": 5},
@@ -959,10 +962,11 @@ GROUP_E_CONTEXTS = [
     {"name": "91min", "before": 45, "after": 45},
     {"name": "121min", "before": 60, "after": 60},
     {"name": "181min", "before": 90, "after": 90},
-    {"name": "221min", "before": 110, "after": 110},
-    {"name": "251min", "before": 125, "after": 125},
-    {"name": "311min", "before": 155, "after": 155},
-    {"name": "401min", "before": 200, "after": 200},
+    {"name": "201min", "before": 100, "after": 100},
+    # Asymmetric: extend past while keeping future at max (100)
+    {"name": "221min_asym", "before": 120, "after": 100},
+    {"name": "341min_asym", "before": 240, "after": 100},
+    {"name": "461min_asym", "before": 360, "after": 100},
 ]
 
 GROUP_E_CHANNELS = [
@@ -2061,8 +2065,8 @@ def main():
         "d620900d_temperatureMeasurement",
     ])
 
-    ctx_before = cfg.get("default_context_before", 125)
-    ctx_after = cfg.get("default_context_after", 125)
+    ctx_before = cfg.get("default_context_before", 100)
+    ctx_after = cfg.get("default_context_after", 100)
     primary_layer = args.layer if args.layer is not None else cfg.get("default_layer", 2)
     stride = cfg.get("stride", 1)
 
