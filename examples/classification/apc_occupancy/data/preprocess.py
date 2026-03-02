@@ -553,6 +553,119 @@ def load_labeled_csv(
 
 
 # ---------------------------------------------------------------------------
+# Public API — v4 (unified sensor array + date-based label split)
+# ---------------------------------------------------------------------------
+
+
+def load_unified_split(
+    train_csv: str | Path,
+    test_csv: str | Path,
+    label_column: str = "occupancy_label",
+    channels: list[str] | None = None,
+    nan_threshold: float = 0.5,
+    split_date: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], pd.DatetimeIndex]:
+    """Load train + test CSVs into a unified sensor array with date-based label split.
+
+    Concatenates both CSVs into one continuous sensor timeline so that
+    context windows can cross the train/test boundary.  Label arrays are
+    split by *split_date*: timesteps before the date get train labels,
+    timesteps at or after get test labels.  The other region is set to -1.
+
+    If *split_date* is ``None``, the boundary between the two CSVs is used
+    (i.e. the first timestamp of the test CSV).
+
+    Parameters
+    ----------
+    train_csv, test_csv : str or Path
+        Paths to the label-embedded CSVs from ``prepare_split.py``.
+    label_column : str
+        Name of the label column.
+    channels : list[str] or None
+        Sensor channels to include.
+    nan_threshold : float
+        Drop channels with NaN fraction above this.
+    split_date : str or None
+        ``"YYYY-MM-DD"`` or ``"YYYY-MM-DD HH:MM"``.  Overrides the
+        natural boundary between the two CSVs.
+
+    Returns
+    -------
+    sensor_array : np.ndarray, shape (N, C)
+        Full unified sensor timeline.
+    train_labels : np.ndarray, shape (N,)
+        Labels for train region; -1 elsewhere.
+    test_labels : np.ndarray, shape (N,)
+        Labels for test region; -1 elsewhere.
+    channel_names : list[str]
+    timestamps : pd.DatetimeIndex
+    """
+    # Load both CSVs
+    tr_df = pd.read_csv(train_csv, parse_dates=["time"], index_col="time",
+                        low_memory=False).sort_index()
+    te_df = pd.read_csv(test_csv, parse_dates=["time"], index_col="time",
+                        low_memory=False).sort_index()
+
+    # Concatenate and deduplicate (keep first occurrence)
+    full_df = pd.concat([tr_df, te_df])
+    full_df = full_df[~full_df.index.duplicated(keep="first")]
+    full_df = full_df.sort_index()
+
+    # Extract labels
+    if label_column not in full_df.columns:
+        raise ValueError(
+            f"Label column {label_column!r} not found. "
+            f"Available: {list(full_df.columns)}"
+        )
+    all_labels = full_df[label_column].values.astype(np.int64)
+    sensor_df = full_df.drop(columns=[label_column])
+
+    # Determine split index
+    if split_date is not None:
+        split_dt = pd.Timestamp(split_date)
+    else:
+        split_dt = te_df.index.min()  # natural boundary
+
+    split_idx = int(np.searchsorted(full_df.index, split_dt))
+
+    # Create masked label arrays
+    train_labels = all_labels.copy()
+    train_labels[split_idx:] = -1  # mask test region
+
+    test_labels = all_labels.copy()
+    test_labels[:split_idx] = -1  # mask train region
+
+    # Channel filtering
+    sensor_df = _filter_channels(
+        sensor_df, nan_threshold, channels, [],
+    )
+    if len(sensor_df.columns) == 0:
+        raise ValueError("No channels remaining after filtering")
+
+    sensor_df = _fill_nan(sensor_df)
+    sensor_array = sensor_df.values.astype(np.float32)
+    channel_names = list(sensor_df.columns)
+    timestamps = full_df.index
+
+    # Stats
+    tr_labeled = (train_labels >= 0).sum()
+    te_labeled = (test_labels >= 0).sum()
+    tr_occ = (train_labels == 1).sum()
+    te_occ = (test_labels == 1).sum()
+    logger.info(
+        "Unified split at %s (%d/%d rows): "
+        "train %d labeled (occ=%d, emp=%d, %.1f%% occ), "
+        "test %d labeled (occ=%d, emp=%d, %.1f%% occ)",
+        split_dt.strftime("%Y-%m-%d %H:%M"), split_idx, len(full_df),
+        tr_labeled, tr_occ, tr_labeled - tr_occ,
+        100 * tr_occ / max(tr_labeled, 1),
+        te_labeled, te_occ, te_labeled - te_occ,
+        100 * te_occ / max(te_labeled, 1),
+    )
+    return sensor_array, train_labels, test_labels, channel_names, timestamps
+
+
+# ---------------------------------------------------------------------------
 # Public API — v2 (single events file + date-based split)
 # ---------------------------------------------------------------------------
 

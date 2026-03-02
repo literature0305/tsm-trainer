@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Phase 2 Comprehensive Sweep: Neural Classification Heads on MantisV2 Frozen Embeddings.
 
-v3: Uses label-embedded CSVs from prepare_split.py.
-Split at midnight Feb 16 (optimal class balance ~48:52 in both sets).
-Labels computed globally across full timeline, embedded in each CSV.
-No data leakage — each CSV is physically separated.
+v4: Unified sensor array with date-based label split.
+Loads both train/test CSVs from prepare_split.py, concatenates into one
+continuous sensor timeline, then splits labels by configurable --split-date.
+Context windows can cross the train/test boundary (sensor overlap allowed;
+label leakage prevented via masked label arrays).
 
 Phase 1 findings (to beat):
   - Best channels: M+C+T1 (3ch) — dominant over M+C (2ch)
@@ -102,7 +103,7 @@ import matplotlib.pyplot as plt
 # Local imports -- run from apc_occupancy/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from data.preprocess import load_labeled_csv
+from data.preprocess import load_unified_split
 from data.dataset import DatasetConfig, OccupancyDataset
 from evaluation.metrics import compute_metrics, compute_wilson_ci, ClassificationMetrics
 from training.heads import build_head
@@ -904,6 +905,7 @@ def run_group_e(
     train_csv: str,
     test_csv: str,
     label_column: str,
+    split_date: str | None,
     stride: int,
     pretrained: str,
     output_token: str,
@@ -915,8 +917,7 @@ def run_group_e(
     """Sweep context windows with neural + sklearn classifiers.
 
     12 contexts x 2 channels x 4 classifiers = 96 experiments.
-    Uses label-embedded CSVs (v3 format). Separate train/test datasets
-    per context window to prevent data leakage.
+    Uses unified sensor array — context windows can cross split boundary.
     """
     logger.info("=" * 70)
     logger.info("GROUP E: Context Window Exploration (96 experiments)")
@@ -933,27 +934,27 @@ def run_group_e(
     exp_idx = 0
 
     for ch_cfg in GROUP_E_CHANNELS:
-        # Load data for this channel set from label-embedded CSVs
+        # Load unified sensor data for this channel set
         channels = _resolve_channels(ch_cfg["keys"])
-        logger.info("Loading data for channels: %s", ch_cfg["name"])
+        logger.info("Loading unified data for channels: %s", ch_cfg["name"])
 
-        train_sensor, train_labels, ch_names, train_ts = load_labeled_csv(
-            train_csv, label_column=label_column, channels=channels,
-        )
-        test_sensor, test_labels, _, test_ts = load_labeled_csv(
-            test_csv, label_column=label_column, channels=channels,
+        sensor, train_labels, test_labels, ch_names, timestamps = load_unified_split(
+            train_csv, test_csv,
+            label_column=label_column, channels=channels,
+            split_date=split_date,
         )
 
         for ctx_cfg in GROUP_E_CONTEXTS:
-            # Build separate train/test datasets with this context
+            # Both datasets share the unified sensor array — context windows
+            # can cross the split boundary (sensor overlap allowed).
             ds_cfg = DatasetConfig(
                 context_mode="bidirectional",
                 context_before=ctx_cfg["before"],
                 context_after=ctx_cfg["after"],
                 stride=stride,
             )
-            train_dataset = OccupancyDataset(train_sensor, train_labels, train_ts, ds_cfg)
-            test_dataset = OccupancyDataset(test_sensor, test_labels, test_ts, ds_cfg)
+            train_dataset = OccupancyDataset(sensor, train_labels, timestamps, ds_cfg)
+            test_dataset = OccupancyDataset(sensor, test_labels, timestamps, ds_cfg)
 
             n_train = len(train_dataset)
             n_test = len(test_dataset)
@@ -1897,6 +1898,8 @@ def main():
                         help="Primary transformer layer (default: from config)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed (default: from config or 42)")
+    parser.add_argument("--split-date", default=None,
+                        help="Override split date (YYYY-MM-DD), e.g. 2026-02-17")
     args = parser.parse_args()
 
     # Setup logging
@@ -1947,48 +1950,48 @@ def main():
     output_token = cfg["model"].get("output_token", "combined")
 
     groups = args.group if args.group else ["D", "E", "F", "G", "H", "I"]
+    split_date = args.split_date if args.split_date else cfg.get("split_date")
 
     logger.info("=" * 70)
-    logger.info("Phase 2 Comprehensive Sweep (v3: label-embedded CSVs)")
+    logger.info("Phase 2 Comprehensive Sweep (v4: unified sensor array)")
     logger.info("  Groups: %s", groups)
     logger.info("  Channels: %s", default_channels)
     logger.info("  Context: %d+1+%d = %dmin (bidirectional)",
                 ctx_before, ctx_after, ctx_before + 1 + ctx_after)
     logger.info("  Layer: L%d", primary_layer)
+    logger.info("  Split date: %s", split_date or "natural CSV boundary")
     logger.info("  Device: %s", device)
     logger.info("  Seed: %d", seed)
     logger.info("=" * 70)
 
-    # --- Load data for non-E groups using label-embedded CSVs ---
+    # --- Load unified sensor data for non-E groups ---
     needs_default_data = any(g in groups for g in ["D", "F", "G", "H", "I"])
 
     if needs_default_data:
-        logger.info("Loading data with default channels (label-embedded CSVs)...")
+        logger.info("Loading unified sensor data with default channels...")
 
-        train_sensor, train_labels, ch_names, train_ts = load_labeled_csv(
-            data_cfg["train_csv"], label_column=label_column,
-            channels=default_channels,
-        )
-        test_sensor, test_labels, _, test_ts = load_labeled_csv(
-            data_cfg["test_csv"], label_column=label_column,
-            channels=default_channels,
+        sensor, train_labels, test_labels, ch_names, timestamps = load_unified_split(
+            data_cfg["train_csv"], data_cfg["test_csv"],
+            label_column=label_column, channels=default_channels,
+            split_date=split_date,
         )
 
         n_train_labeled = (train_labels >= 0).sum()
         n_test_labeled = (test_labels >= 0).sum()
-        logger.info("Loaded: train=%d rows (%d labeled), test=%d rows (%d labeled)",
-                     len(train_sensor), n_train_labeled,
-                     len(test_sensor), n_test_labeled)
+        logger.info("Unified: %d rows, train=%d labeled, test=%d labeled",
+                     len(sensor), n_train_labeled, n_test_labeled)
 
-        # Build separate train/test datasets with default context
+        # Build datasets from unified sensor array with default context
         ds_config = DatasetConfig(
             context_mode="bidirectional",
             context_before=ctx_before,
             context_after=ctx_after,
             stride=stride,
         )
-        train_dataset = OccupancyDataset(train_sensor, train_labels, train_ts, ds_config)
-        test_dataset = OccupancyDataset(test_sensor, test_labels, test_ts, ds_config)
+        # Both datasets share the unified sensor array — context windows
+        # can cross the split boundary (sensor overlap allowed).
+        train_dataset = OccupancyDataset(sensor, train_labels, timestamps, ds_config)
+        test_dataset = OccupancyDataset(sensor, test_labels, timestamps, ds_config)
 
         n_train = len(train_dataset)
         n_test = len(test_dataset)
@@ -2040,6 +2043,7 @@ def main():
                 train_csv=data_cfg["train_csv"],
                 test_csv=data_cfg["test_csv"],
                 label_column=label_column,
+                split_date=split_date,
                 stride=stride,
                 pretrained=pretrained,
                 output_token=output_token,
