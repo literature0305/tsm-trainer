@@ -5,6 +5,10 @@
 #   - Layer choice is negligible (±0.01 AUC across L0-L5)
 #   - MantisV2 only supports output_token="combined" (cls/mean fail)
 #
+# CRITICAL FIX: Uses separate train/test event files (P4-style) instead of
+#   split_date. The old split_date="2026-02-15" created ~50:50 split instead
+#   of the intended ~75:25 ratio from the curated event files.
+#
 # 3 parallel sweep groups (A/B/C) for optimal configuration search.
 #
 # Usage:
@@ -20,18 +24,19 @@
 
 seed: 42
 output_dir: results/phase1_sweep
-split_date: "2026-02-15"
 
 # --- Model ---
 model:
   pretrained_name: "paris-noah/MantisV2"
 
-# --- Data ---
-# Cleaned event-based labels + 1-min interval sensor data (02/09~02/23).
+# --- Data (P4-style: separate train/test event files) ---
+# 1-min interval sensor data (02/09~02/23) + curated event-based labels (02/10~02/19).
 # Binary: count >= 1 = Occupied, count = 0 = Empty.
+# Train/test split follows the original ~75:25 curated event files.
 data:
   sensor_csv: "/group-volume/ts-dataset/AIHub/enter_leave/merged_processed_data_with_motion_count_0209_0223_interval1.csv"
-  label_csv: "/group-volume/ts-dataset/AIHub/enter_leave/occupancy_events_0210_0219_processed_with_none_cleaned.csv"
+  train_label_csv: "/group-volume/ts-dataset/AIHub/enter_leave/occupancy_events_0210_0219_processed_train.csv"
+  test_label_csv: "/group-volume/ts-dataset/AIHub/enter_leave/occupancy_events_0210_0219_processed_test.csv"
   label_format: "events"
   initial_occupancy: 0
   binarize: true

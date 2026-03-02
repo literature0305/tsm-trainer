@@ -6,6 +6,10 @@ Findings from initial round: context window is the dominant factor
 (AUC scales from 0.56 at 1min to 0.84 at 241min, no saturation).
 Layer choice is negligible (±0.01 AUC range at any given context).
 
+CRITICAL: Uses P4-style separate train/test event files to maintain
+the curated ~75:25 train/test ratio. The old split_date approach
+created ~50:50 split, invalidating all previous results.
+
 Three sweep groups (run independently on separate GPUs):
 
   Group A — Context Window Deep Exploration (~51 experiments)
@@ -64,8 +68,8 @@ import matplotlib.pyplot as plt
 # Local imports — run from apc_occupancy/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from data.preprocess import PreprocessConfig, load_occupancy_data
-from data.dataset import DatasetConfig, OccupancyDataset, build_dataset_config
+from data.preprocess import PreprocessConfig, load_sensor_and_labels
+from data.dataset import DatasetConfig, OccupancyDataset
 from evaluation.metrics import compute_metrics, compute_wilson_ci, ClassificationMetrics
 
 logger = logging.getLogger(__name__)
@@ -192,6 +196,87 @@ GROUP_C_CONTEXTS = [
     {"name": "241min", "context_before": 120, "context_after": 120},
     {"name": "361min", "context_before": 180, "context_after": 180},
 ]
+
+
+# ============================================================================
+# Data loading — P4-style (separate train/test event files)
+# ============================================================================
+
+def load_train_test_data(
+    cfg: dict,
+    channels: list[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], pd.DatetimeIndex]:
+    """Load sensor data with separate train/test labels (P4-style).
+
+    Uses two separate event CSV files for train and test splits,
+    maintaining the curated ~75:25 ratio.
+
+    Returns
+    -------
+    sensor_arr : shape (n_timesteps, n_channels)
+    all_labels : shape (n_timesteps,) — merged (train + test, -1 = unlabeled)
+    train_labels : shape (n_timesteps,) — train only (-1 elsewhere)
+    test_labels : shape (n_timesteps,) — test only (-1 elsewhere)
+    ch_names : channel name list
+    timestamps : DatetimeIndex
+    """
+    data_cfg = cfg["data"]
+    ch = channels or cfg.get("default_channels")
+
+    base_kwargs = dict(
+        sensor_csv=data_cfg["sensor_csv"],
+        label_format=data_cfg.get("label_format", "events"),
+        initial_occupancy=data_cfg.get("initial_occupancy", 0),
+        binarize=data_cfg.get("binarize", True),
+        channels=ch,
+    )
+
+    # Load sensor + train labels
+    train_prep = PreprocessConfig(label_csv=data_cfg["train_label_csv"], **base_kwargs)
+    sensor_arr, train_labels, ch_names, timestamps, _ = load_sensor_and_labels(train_prep)
+
+    # Load test labels (same sensor CSV, different events)
+    test_prep = PreprocessConfig(label_csv=data_cfg["test_label_csv"], **base_kwargs)
+    _, test_labels, _, _, _ = load_sensor_and_labels(test_prep)
+
+    # Resolve overlap: train takes priority
+    overlap = (train_labels >= 0) & (test_labels >= 0)
+    if overlap.sum() > 0:
+        logger.warning(
+            "Resolving %d overlapping timesteps (train takes priority)",
+            overlap.sum(),
+        )
+        test_labels[overlap] = -1
+
+    # Merge for dataset construction
+    all_labels = np.where(train_labels >= 0, train_labels, test_labels)
+
+    n_train = (train_labels >= 0).sum()
+    n_test = (test_labels >= 0).sum()
+    n_total = (all_labels >= 0).sum()
+    logger.info(
+        "P4-style split: train=%d, test=%d, total=%d labeled (%.1f:%.1f ratio)",
+        n_train, n_test, n_total,
+        100 * n_train / max(n_total, 1), 100 * n_test / max(n_total, 1),
+    )
+
+    return sensor_arr, all_labels, train_labels, test_labels, ch_names, timestamps
+
+
+def get_label_masks(
+    dataset: OccupancyDataset,
+    train_labels: np.ndarray,
+    test_labels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute train/test boolean masks from label arrays.
+
+    Uses the dataset's valid_indices to determine which windows
+    belong to train vs test based on the original label arrays.
+    """
+    valid_idx = dataset._valid_indices
+    train_mask = train_labels[valid_idx] >= 0
+    test_mask = test_labels[valid_idx] >= 0
+    return train_mask, test_mask
 
 
 # ============================================================================
@@ -323,24 +408,14 @@ def run_group_a(cfg: dict, device: str, output_dir: Path) -> list[dict]:
 
     results = []
     default_channels = cfg.get("default_channels", ["d620900d_motionSensor", "408981c2_contactSensor"])
-    split_date = cfg.get("split_date", "2026-02-15")
     pretrained = cfg["model"]["pretrained_name"]
     seed = cfg.get("seed", 42)
-    default_layer = cfg.get("default_layer", 2)  # L2 best from initial round
+    default_layer = cfg.get("default_layer", 2)
 
-    # Load sensor data once (shared across all context configs)
-    prep_cfg = PreprocessConfig(
-        sensor_csv=cfg["data"]["sensor_csv"],
-        label_csv=cfg["data"]["label_csv"],
-        label_format="events",
-        initial_occupancy=cfg["data"].get("initial_occupancy", 0),
-        binarize=True,
-        channels=default_channels,
+    # Load sensor data with P4-style train/test split (shared across all context configs)
+    sensor_arr, all_labels, train_labels, test_labels, ch_names, timestamps = (
+        load_train_test_data(cfg, channels=default_channels)
     )
-    sensor_arr, train_labels, test_labels, ch_names, timestamps = (
-        load_occupancy_data(prep_cfg, split_date=split_date)
-    )
-    all_labels = np.where(train_labels >= 0, train_labels, test_labels)
 
     for i, ctx_cfg in enumerate(ALL_CONTEXT_CONFIGS, 1):
         ctx_name = ctx_cfg["name"]
@@ -358,7 +433,7 @@ def run_group_a(cfg: dict, device: str, output_dir: Path) -> list[dict]:
                 stride=cfg.get("stride", 1),
             )
             dataset = OccupancyDataset(sensor_arr, all_labels, timestamps, ds_config)
-            train_mask, test_mask = dataset.get_train_test_split(split_date)
+            train_mask, test_mask = get_label_masks(dataset, train_labels, test_labels)
 
             if train_mask.sum() == 0 or test_mask.sum() == 0:
                 logger.warning("Skipping %s: empty train or test split", ctx_name)
@@ -411,9 +486,10 @@ def run_group_a(cfg: dict, device: str, output_dir: Path) -> list[dict]:
             }
             results.append(row)
             logger.info(
-                "    Acc=%.4f  F1=%.4f  AUC=%.4f  (%.1fs)",
+                "    Acc=%.4f  F1=%.4f  AUC=%.4f  train=%d test=%d (%.1fs)",
                 metrics.accuracy, metrics.f1,
                 metrics.roc_auc if not np.isnan(metrics.roc_auc) else 0.0,
+                int(train_mask.sum()), int(test_mask.sum()),
                 elapsed,
             )
         except Exception as e:
@@ -451,7 +527,6 @@ def run_group_b(cfg: dict, device: str, output_dir: Path) -> list[dict]:
     logger.info("=" * 70)
 
     results = []
-    split_date = cfg.get("split_date", "2026-02-15")
     pretrained = cfg["model"]["pretrained_name"]
     seed = cfg.get("seed", 42)
     default_layer = cfg.get("default_layer", 2)
@@ -471,29 +546,19 @@ def run_group_b(cfg: dict, device: str, output_dir: Path) -> list[dict]:
             t0 = time.time()
 
             try:
+                # Load data with specific channels (P4-style split)
+                sensor_arr, all_labels, train_labels, test_labels, ch_names_loaded, timestamps = (
+                    load_train_test_data(cfg, channels=channels)
+                )
+
                 ds_config = DatasetConfig(
                     context_mode="bidirectional",
                     context_before=ctx_before,
                     context_after=ctx_after,
                     stride=cfg.get("stride", 1),
                 )
-
-                prep_cfg = PreprocessConfig(
-                    sensor_csv=cfg["data"]["sensor_csv"],
-                    label_csv=cfg["data"]["label_csv"],
-                    label_format="events",
-                    initial_occupancy=cfg["data"].get("initial_occupancy", 0),
-                    binarize=True,
-                    channels=channels,
-                )
-
-                sensor_arr, train_labels, test_labels, ch_names_loaded, timestamps = (
-                    load_occupancy_data(prep_cfg, split_date=split_date)
-                )
-
-                all_labels = np.where(train_labels >= 0, train_labels, test_labels)
                 dataset = OccupancyDataset(sensor_arr, all_labels, timestamps, ds_config)
-                train_mask, test_mask = dataset.get_train_test_split(split_date)
+                train_mask, test_mask = get_label_masks(dataset, train_labels, test_labels)
 
                 if train_mask.sum() == 0 or test_mask.sum() == 0:
                     logger.warning("Skipping %s|%s: empty split", ctx_name, ch_name)
@@ -535,9 +600,10 @@ def run_group_b(cfg: dict, device: str, output_dir: Path) -> list[dict]:
                 }
                 results.append(row)
                 logger.info(
-                    "    Acc=%.4f  F1=%.4f  AUC=%.4f  (%.1fs)",
+                    "    Acc=%.4f  F1=%.4f  AUC=%.4f  train=%d test=%d (%.1fs)",
                     metrics.accuracy, metrics.f1,
                     metrics.roc_auc if not np.isnan(metrics.roc_auc) else 0.0,
+                    int(train_mask.sum()), int(test_mask.sum()),
                     elapsed,
                 )
             except Exception as e:
@@ -575,23 +641,13 @@ def run_group_c(cfg: dict, device: str, output_dir: Path) -> list[dict]:
 
     results = []
     default_channels = cfg.get("default_channels", ["d620900d_motionSensor", "408981c2_contactSensor"])
-    split_date = cfg.get("split_date", "2026-02-15")
     pretrained = cfg["model"]["pretrained_name"]
     seed = cfg.get("seed", 42)
 
-    # Load sensor data once
-    prep_cfg = PreprocessConfig(
-        sensor_csv=cfg["data"]["sensor_csv"],
-        label_csv=cfg["data"]["label_csv"],
-        label_format="events",
-        initial_occupancy=cfg["data"].get("initial_occupancy", 0),
-        binarize=True,
-        channels=default_channels,
+    # Load sensor data with P4-style split (shared across all combos)
+    sensor_arr, all_labels, train_labels, test_labels, ch_names, timestamps = (
+        load_train_test_data(cfg, channels=default_channels)
     )
-    sensor_arr, train_labels, test_labels, ch_names, timestamps = (
-        load_occupancy_data(prep_cfg, split_date=split_date)
-    )
-    all_labels = np.where(train_labels >= 0, train_labels, test_labels)
 
     exp_idx = 0
     for ctx_cfg in GROUP_C_CONTEXTS:
@@ -609,7 +665,7 @@ def run_group_c(cfg: dict, device: str, output_dir: Path) -> list[dict]:
 
         try:
             dataset = OccupancyDataset(sensor_arr, all_labels, timestamps, ds_config)
-            train_mask, test_mask = dataset.get_train_test_split(split_date)
+            train_mask, test_mask = get_label_masks(dataset, train_labels, test_labels)
         except Exception as e:
             logger.error("Dataset build failed for %s: %s", ctx_name, e)
             continue
@@ -672,10 +728,11 @@ def run_group_c(cfg: dict, device: str, output_dir: Path) -> list[dict]:
                     }
                     results.append(row)
                     logger.info(
-                        "  [%d/%d] %s: Acc=%.4f  F1=%.4f  AUC=%.4f  (%.1fs)",
+                        "  [%d/%d] %s: Acc=%.4f  F1=%.4f  AUC=%.4f  train=%d test=%d (%.1fs)",
                         exp_idx, n_total, exp_name,
                         metrics.accuracy, metrics.f1,
                         metrics.roc_auc if not np.isnan(metrics.roc_auc) else 0.0,
+                        int(train_mask.sum()), int(test_mask.sum()),
                         elapsed,
                     )
                 except Exception as e:
@@ -856,11 +913,14 @@ def generate_summary(all_results: list[dict], output_dir: Path):
         acc = row.get("accuracy", 0)
         auc_val = row.get("auc")
         eer_val = row.get("eer")
+        n_train = row.get("n_train", "?")
+        n_test = row.get("n_test", "?")
         auc_str = f"AUC={auc_val:.4f}" if auc_val is not None else "AUC=N/A"
         eer_str = f" EER={eer_val:.4f}" if eer_val is not None else ""
         logger.info(
-            "  #%2d [%s] %s | L%s | %s | %s | %s: %s%s Acc=%.4f",
+            "  #%2d [%s] %s | L%s | %s | %s | %s: %s%s Acc=%.4f (train=%s,test=%s)",
             i + 1, group, ctx, layer, ch, clf, token, auc_str, eer_str, acc,
+            n_train, n_test,
         )
 
     # Save summary JSON
@@ -872,6 +932,7 @@ def generate_summary(all_results: list[dict], output_dir: Path):
         "failed": len(all_results) - len(valid),
         "with_auc": len(has_auc),
         "without_auc": len(no_auc),
+        "split_method": "P4-style (separate train/test event files)",
         "top5": ranked.head(5).to_dict("records"),
         "metric_note": "Primary: AUC (threshold-independent), Secondary: EER",
     }
@@ -899,8 +960,6 @@ def main():
     parser.add_argument("--device", default="cuda", help="Device (cuda or cpu)")
     parser.add_argument("--stride", type=int, default=None,
                         help="Override stride (default from config)")
-    parser.add_argument("--split-date", default=None,
-                        help="Override train/test split date (YYYY-MM-DD)")
     args = parser.parse_args()
 
     # Setup logging
@@ -913,8 +972,6 @@ def main():
     cfg = load_config(args.config)
     if args.stride is not None:
         cfg["stride"] = args.stride
-    if args.split_date is not None:
-        cfg["split_date"] = args.split_date
 
     output_dir = Path(cfg.get("output_dir", "results/phase1_sweep"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -923,6 +980,7 @@ def main():
     logger.info("Device: %s", device)
     logger.info("Config: %s", args.config)
     logger.info("Output: %s", output_dir)
+    logger.info("Split method: P4-style (separate train/test event files)")
 
     t_start = time.time()
     all_results = []

@@ -3,7 +3,7 @@
 
 Generates publication-quality t-SNE figures analyzing MantisV2 embeddings
 for the binary occupancy (Empty/Occupied) classification task.
-Uses train/test split (date-based at 2026-02-15).
+Uses P4-style separate train/test event files (~75:25 curated ratio).
 
 Representative model:
     MantisV2 L2, M+C+T1 (3 channels, 1536-d), 120+1+120 bidirectional.
@@ -19,13 +19,13 @@ Figures (saved as PNG + PDF):
 
 Usage:
     cd examples/classification/apc_occupancy
-    python analysis/run_visualization_analysis.py \
-        --config training/configs/occupancy-phase1.yaml \
+    python analysis/run_visualization_analysis.py \\
+        --config training/configs/occupancy-phase1.yaml \\
         --device cuda --output-dir results/visualization_analysis
 
     # Selective figures:
-    python analysis/run_visualization_analysis.py \
-        --config training/configs/occupancy-phase1.yaml \
+    python analysis/run_visualization_analysis.py \\
+        --config training/configs/occupancy-phase1.yaml \\
         --device cuda --figures 5 6 7
 """
 
@@ -61,7 +61,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _SCRIPT_DIR.parent  # apc_occupancy/
 sys.path.insert(0, str(_PROJECT_DIR))
 
-from data.preprocess import PreprocessConfig, load_occupancy_data
+from data.preprocess import PreprocessConfig, load_sensor_and_labels
 from data.dataset import DatasetConfig, OccupancyDataset
 
 logger = logging.getLogger(__name__)
@@ -122,7 +122,11 @@ def save_fig(fig, output_dir: Path, name: str):
 # ============================================================================
 
 def tsne_2d(Z: np.ndarray, seed: int = 42, pca_pre: int = 50) -> np.ndarray:
-    """Scale -> PCA pre-reduction -> t-SNE to 2D."""
+    """Scale -> PCA pre-reduction -> t-SNE to 2D.
+
+    Uses ALL input samples (no subsampling) for richer, more continuous
+    embedding space visualization.
+    """
     n, d = Z.shape
     X = StandardScaler().fit_transform(Z)
     n_pre = min(pca_pre, d, n)
@@ -155,25 +159,53 @@ def load_config(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
-def load_data(raw_cfg: dict, split_date: str = "2026-02-15",
-              channels: list[str] | None = None):
-    """Load sensor + labels with date-based train/test split.
+def load_data(raw_cfg: dict, channels: list[str] | None = None):
+    """Load sensor + labels with P4-style train/test split.
+
+    Uses separate train/test event files for the curated ~75:25 ratio.
 
     Returns (sensor_array, train_labels, test_labels, channel_names, timestamps).
     """
     data_cfg = raw_cfg.get("data", {})
-    cfg = PreprocessConfig(
+    ch = channels or raw_cfg.get("default_channels") or data_cfg.get("channels")
+
+    base_kwargs = dict(
         sensor_csv=data_cfg.get("sensor_csv", ""),
-        label_csv=data_cfg.get("label_csv", ""),
         label_format=data_cfg.get("label_format", "events"),
         initial_occupancy=data_cfg.get("initial_occupancy", 0),
         nan_threshold=data_cfg.get("nan_threshold", 0.5),
-        channels=channels or data_cfg.get("channels"),
         exclude_channels=data_cfg.get("exclude_channels", []),
         binarize=data_cfg.get("binarize", True),
         add_time_features=data_cfg.get("add_time_features", False),
     )
-    return load_occupancy_data(cfg, split_date=split_date)
+
+    # Load sensor + train labels
+    train_prep = PreprocessConfig(
+        label_csv=data_cfg.get("train_label_csv", ""),
+        channels=ch,
+        **base_kwargs,
+    )
+    sensor_arr, train_labels, ch_names, timestamps, _ = load_sensor_and_labels(train_prep)
+
+    # Load test labels (same sensor, different events)
+    test_prep = PreprocessConfig(
+        label_csv=data_cfg.get("test_label_csv", ""),
+        channels=ch,
+        **base_kwargs,
+    )
+    _, test_labels, _, _, _ = load_sensor_and_labels(test_prep)
+
+    # Resolve overlap: train takes priority
+    overlap = (train_labels >= 0) & (test_labels >= 0)
+    if overlap.sum() > 0:
+        logger.warning("Resolving %d overlapping timesteps (train priority)", overlap.sum())
+        test_labels[overlap] = -1
+
+    n_train = (train_labels >= 0).sum()
+    n_test = (test_labels >= 0).sum()
+    logger.info("P4 split: train=%d, test=%d labeled", n_train, n_test)
+
+    return sensor_arr, train_labels, test_labels, ch_names, timestamps
 
 
 def load_mantis(pretrained: str, layer: int, output_token: str, device: str):
@@ -205,25 +237,19 @@ def extract_embeddings(
     X, y = dataset.get_numpy_arrays()
     if len(X) == 0:
         return np.array([]), np.array([])
-    Z = model.transform(X)
-    if int(np.isnan(Z).sum()) > 0:
+
+    # MantisV2 Channel Independence: per-channel then concatenate
+    n_samples, n_channels, seq_len = X.shape
+    all_emb = []
+    for ch in range(n_channels):
+        X_ch = X[:, [ch], :]
+        Z_ch = model.transform(X_ch)
+        all_emb.append(Z_ch)
+    Z = np.concatenate(all_emb, axis=-1)
+
+    if np.isnan(Z).any():
         Z = np.nan_to_num(Z, nan=0.0)
     return Z, y
-
-
-def subsample_balanced(Z, y, max_per_class=500, seed=42):
-    """Balanced subsampling for visualization."""
-    rng = np.random.RandomState(seed)
-    indices = []
-    for cls in np.unique(y):
-        cls_idx = np.where(y == cls)[0]
-        if len(cls_idx) > max_per_class:
-            chosen = rng.choice(cls_idx, max_per_class, replace=False)
-            indices.extend(chosen.tolist())
-        else:
-            indices.extend(cls_idx.tolist())
-    indices = sorted(indices)
-    return Z[indices], y[indices], np.array(indices)
 
 
 # ============================================================================
@@ -308,6 +334,7 @@ def fig1_train_test_embeddings(emb_tr, y_tr, emb_te, y_te, output_dir: Path):
     """Side-by-side t-SNE: Train vs Test with binary class coloring.
 
     Uses pre-computed joint t-SNE coordinates for consistency.
+    All available samples used (no subsampling).
     """
     setup_style()
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
@@ -323,7 +350,7 @@ def fig1_train_test_embeddings(emb_tr, y_tr, emb_te, y_te, output_dir: Path):
                 ax.scatter(
                     emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
                     label=f"{CLASS_NAMES[cls]} ({m.sum()})",
-                    s=15, alpha=0.55, edgecolors="white", linewidths=0.15,
+                    s=8, alpha=0.45, edgecolors="none",
                 )
         n_total = len(y)
         ax.set_title(
@@ -339,7 +366,7 @@ def fig1_train_test_embeddings(emb_tr, y_tr, emb_te, y_te, output_dir: Path):
     fig.suptitle(
         "Occupancy Embedding Space: Train vs Test\n"
         "(MantisV2 L2, M+C+T1, 120+1+120 bidirectional, "
-        "split at 2026-02-15)",
+        "P4-style ~75:25 split)",
         fontsize=12, fontweight="bold", y=1.03,
     )
     fig.tight_layout()
@@ -348,18 +375,11 @@ def fig1_train_test_embeddings(emb_tr, y_tr, emb_te, y_te, output_dir: Path):
 
 # ============================================================================
 # Figure 2: Classification Overlay (SVM vs MLP)
-# Scenario: Compares SVM_rbf and MLP[128]-d0.5 on the held-out test set.
-#   Red X markers show misclassified samples — typically located at the
-#   boundary between Empty and Occupied clusters. Highlights where each
-#   classifier struggles and whether they make similar mistakes.
 # ============================================================================
 
 def fig2_classification_overlay(emb_te, y_te, pred_svm, pred_mlp,
                                   output_dir: Path):
-    """Side-by-side: SVM vs MLP classification results on test set.
-
-    Uses pre-computed t-SNE coordinates for consistency with Fig 1/4.
-    """
+    """Side-by-side: SVM vs MLP classification results on test set."""
     setup_style()
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
 
@@ -377,7 +397,7 @@ def fig2_classification_overlay(emb_te, y_te, pred_svm, pred_mlp,
                 ax.scatter(
                     emb_te[m, 0], emb_te[m, 1], c=CLASS_COLORS[cls],
                     label=CLASS_NAMES[cls],
-                    s=14, alpha=0.5, edgecolors="white", linewidths=0.15,
+                    s=8, alpha=0.45, edgecolors="none",
                 )
 
         if incorrect.any():
@@ -414,10 +434,6 @@ def fig2_classification_overlay(emb_te, y_te, pred_svm, pred_mlp,
 
 # ============================================================================
 # Figure 3: Decision Boundary (PCA 2D)
-# Scenario: Projects embeddings to 2D via PCA (preserves linear structure)
-#   and visualizes SVM decision boundaries. Unlike t-SNE, PCA supports
-#   decision surface rendering. The contour shows where the classifier
-#   transitions between Empty and Occupied predictions.
 # ============================================================================
 
 def fig3_decision_boundary(Z_train, y_train, Z_test, y_test,
@@ -425,22 +441,14 @@ def fig3_decision_boundary(Z_train, y_train, Z_test, y_test,
     """Side-by-side PCA 2D: SVM vs MLP decision boundary."""
     setup_style()
 
-    # Subsample train for faster SVM fitting on 2D
-    Z_tr_sub, y_tr_sub, _ = subsample_balanced(Z_train, y_train,
-                                                 max_per_class=1000)
-    Z_te_sub, y_te_sub, te_idx = subsample_balanced(Z_test, y_test,
-                                                      max_per_class=600)
-    pred_svm_sub = y_pred_svm[te_idx]
-    pred_mlp_sub = y_pred_mlp[te_idx]
-
     # PCA for decision boundary (t-SNE doesn't preserve for boundaries)
     scaler = StandardScaler()
-    Z_all = np.concatenate([Z_tr_sub, Z_te_sub])
+    Z_all = np.concatenate([Z_train, Z_test])
     Z_scaled = scaler.fit_transform(Z_all)
     pca = PCA(n_components=2, random_state=42)
     Z_2d = pca.fit_transform(Z_scaled)
 
-    n_tr = len(Z_tr_sub)
+    n_tr = len(Z_train)
     Z_2d_train = Z_2d[:n_tr]
     Z_2d_test = Z_2d[n_tr:]
     ev1 = pca.explained_variance_ratio_[0]
@@ -449,14 +457,14 @@ def fig3_decision_boundary(Z_train, y_train, Z_test, y_test,
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
 
     for col, (name, y_pred) in enumerate([
-        ("SVM_rbf (sklearn)", pred_svm_sub),
-        ("MLP[128]-d0.5 (neural)", pred_mlp_sub),
+        ("SVM_rbf (sklearn)", y_pred_svm),
+        ("MLP[128]-d0.5 (neural)", y_pred_mlp),
     ]):
         ax = axes[col]
 
         # Fit an SVM on PCA-2D for boundary visualization
         clf_2d = SVC(kernel="rbf", C=1.0, gamma="scale")
-        clf_2d.fit(Z_2d_train, y_tr_sub)
+        clf_2d.fit(Z_2d_train, y_train)
 
         # Decision region mesh
         margin = 1.5
@@ -480,14 +488,14 @@ def fig3_decision_boundary(Z_train, y_train, Z_test, y_test,
         )
 
         # Test points
-        correct = y_te_sub == y_pred
+        correct = y_test == y_pred
         incorrect = ~correct
         for cls in sorted(CLASS_COLORS):
-            m = (y_te_sub == cls) & correct
+            m = (y_test == cls) & correct
             if m.any():
                 ax.scatter(
                     Z_2d_test[m, 0], Z_2d_test[m, 1], c=CLASS_COLORS[cls],
-                    s=12, alpha=0.5, edgecolors="white", linewidths=0.15,
+                    s=8, alpha=0.45, edgecolors="none",
                     label=CLASS_NAMES[cls],
                 )
         if incorrect.any():
@@ -519,18 +527,11 @@ def fig3_decision_boundary(Z_train, y_train, Z_test, y_test,
 
 # ============================================================================
 # Figure 4: Uncertainty Analysis
-# Scenario: Examines prediction uncertainty via entropy heatmaps and
-#   confidence scatter. High-entropy regions in the t-SNE map indicate
-#   where the model is uncertain. Panel (c) shows whether SVM and MLP
-#   disagree on the same samples. Panel (d) reveals calibration.
 # ============================================================================
 
 def fig4_uncertainty_analysis(emb_te, y_te, prob_svm, prob_mlp,
                                 pred_svm, pred_mlp, output_dir: Path):
-    """4-panel uncertainty comparison: entropy maps + scatter + confidence.
-
-    Uses pre-computed t-SNE coordinates for consistency with Fig 1/2.
-    """
+    """4-panel uncertainty comparison: entropy maps + scatter + confidence."""
     setup_style()
 
     ent_svm = scipy_entropy(prob_svm, axis=1)
@@ -543,8 +544,7 @@ def fig4_uncertainty_analysis(emb_te, y_te, prob_svm, prob_mlp,
     ax = axes[0, 0]
     sc = ax.scatter(
         emb_te[:, 0], emb_te[:, 1], c=ent_svm, cmap="YlOrRd",
-        s=14, alpha=0.8, vmin=0, vmax=max_ent, edgecolors="white",
-        linewidths=0.15,
+        s=8, alpha=0.7, vmin=0, vmax=max_ent, edgecolors="none",
     )
     cbar = fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02, aspect=25)
     cbar.set_label("Entropy", fontsize=8)
@@ -557,8 +557,7 @@ def fig4_uncertainty_analysis(emb_te, y_te, prob_svm, prob_mlp,
     ax = axes[0, 1]
     sc = ax.scatter(
         emb_te[:, 0], emb_te[:, 1], c=ent_mlp, cmap="YlOrRd",
-        s=14, alpha=0.8, vmin=0, vmax=max_ent, edgecolors="white",
-        linewidths=0.15,
+        s=8, alpha=0.7, vmin=0, vmax=max_ent, edgecolors="none",
     )
     cbar = fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02, aspect=25)
     cbar.set_label("Entropy", fontsize=8)
@@ -616,8 +615,8 @@ def fig4_uncertainty_analysis(emb_te, y_te, prob_svm, prob_mlp,
     conf_svm = prob_svm.max(axis=1)
     conf_mlp = prob_mlp.max(axis=1)
     colors = np.where(y_te == pred_svm, ACCENT_GREEN, ACCENT_RED)
-    ax.scatter(conf_svm, conf_mlp, c=colors, s=12, alpha=0.5,
-               edgecolors="white", linewidths=0.15)
+    ax.scatter(conf_svm, conf_mlp, c=colors, s=8, alpha=0.45,
+               edgecolors="none")
     ax.plot([0.5, 1], [0.5, 1], "k--", alpha=0.2, linewidth=0.8)
     ax.set_xlabel("SVM Max Probability")
     ax.set_ylabel("MLP Max Probability")
@@ -648,16 +647,15 @@ def fig4_uncertainty_analysis(emb_te, y_te, prob_svm, prob_mlp,
 # ============================================================================
 # Figure 5: Layer Ablation (2x3 grid)
 # Scenario: Which transformer layer produces the best class separation?
-#   Early layers (L0-L1) capture low-level temporal patterns; deeper
-#   layers (L3-L5) form higher-level abstractions. Phase 1 sweep found
-#   layers are nearly interchangeable for occupancy (±0.01 AUC), but
-#   L0 and L2 performed marginally best.
 # ============================================================================
 
 def fig5_layer_ablation(pretrained, output_token, device,
                         sensor_arr, test_labels, timestamps, ch_names,
                         ctx_before, ctx_after, seed, output_dir: Path):
-    """2x3 grid: t-SNE from each transformer layer L0-L5 (test set)."""
+    """2x3 grid: t-SNE from each transformer layer L0-L5 (test set).
+
+    Uses ALL test samples (no subsampling) for richer visualization.
+    """
     setup_style()
     layers = [0, 1, 2, 3, 4, 5]
     default_layer = 2
@@ -682,18 +680,16 @@ def fig5_layer_ablation(pretrained, output_token, device,
                     transform=ax.transAxes, fontsize=14, color="#999999")
             continue
 
-        Z_sub, y_sub, _ = subsample_balanced(Z_te, y_te, max_per_class=400,
-                                              seed=seed)
-        emb = tsne_2d(Z_sub, seed=seed)
+        logger.info("  Fig5 L%d: t-SNE on %d samples...", layer, len(Z_te))
+        emb = tsne_2d(Z_te, seed=seed)
         for cls in sorted(CLASS_COLORS):
-            m = y_sub == cls
+            m = y_te == cls
             if m.any():
                 ax.scatter(emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
-                           s=14, alpha=0.55, edgecolors="white",
-                           linewidths=0.15)
+                           s=6, alpha=0.4, edgecolors="none")
 
         tag = " *" if layer == default_layer else ""
-        ax.set_title(f"L{layer}{tag}  (N={len(y_sub)})", fontsize=10,
+        ax.set_title(f"L{layer}{tag}  (N={len(y_te)})", fontsize=10,
                      fontweight="bold")
         ax.set_xlabel("t-SNE 1", fontsize=8)
         ax.set_ylabel("t-SNE 2", fontsize=8)
@@ -717,15 +713,14 @@ def fig5_layer_ablation(pretrained, output_token, device,
 
 # ============================================================================
 # Figure 6: Context Window Ablation (2x3 grid)
-# Scenario: How does the size of the temporal context window affect class
-#   separation? Occupancy states persist over long periods, so larger
-#   context windows (120+1+120 = 241 min) were found to be optimal.
-#   This is the opposite of Enter/Leave where short windows dominate.
 # ============================================================================
 
 def fig6_context_ablation(model, sensor_arr, test_labels, timestamps,
                            ch_names, seed, output_dir: Path):
-    """2x3 grid: t-SNE with varying context windows (test set)."""
+    """2x3 grid: t-SNE with varying context windows (test set).
+
+    Uses ALL test samples for richer, more continuous visualization.
+    """
     setup_style()
     contexts = [
         (5, 5, "5+1+5 (11 min)"),
@@ -751,18 +746,16 @@ def fig6_context_ablation(model, sensor_arr, test_labels, timestamps,
                     transform=ax.transAxes, fontsize=14, color="#999999")
             continue
 
-        Z_sub, y_sub, _ = subsample_balanced(Z_te, y_te, max_per_class=400,
-                                              seed=seed)
-        emb = tsne_2d(Z_sub, seed=seed)
+        logger.info("  Fig6 %s: t-SNE on %d samples...", label, len(Z_te))
+        emb = tsne_2d(Z_te, seed=seed)
 
         for cls in sorted(CLASS_COLORS):
-            m = y_sub == cls
+            m = y_te == cls
             if m.any():
                 ax.scatter(emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
-                           s=14, alpha=0.55, edgecolors="white",
-                           linewidths=0.15)
+                           s=6, alpha=0.4, edgecolors="none")
 
-        ax.set_title(f"{label}  (N={len(y_sub)})", fontsize=9,
+        ax.set_title(f"{label}  (N={len(y_te)})", fontsize=9,
                      fontweight="bold")
         ax.set_xlabel("t-SNE 1", fontsize=8)
         ax.set_ylabel("t-SNE 2", fontsize=8)
@@ -785,16 +778,15 @@ def fig6_context_ablation(model, sensor_arr, test_labels, timestamps,
 
 # ============================================================================
 # Figure 7: Channel Ablation (2x3 grid)
-# Scenario: Which sensor channels contribute most to class separation?
-#   M (motion) is the strongest single channel for occupancy. C (contact)
-#   adds entry/exit information. T1 (temperature) adds thermal signature.
-#   Phase 1 found M+C+T1 optimal (AUC=0.8937 with L0).
 # ============================================================================
 
 def fig7_channel_ablation(raw_cfg, pretrained, output_token, device,
-                           split_date, ctx_before, ctx_after, default_layer,
+                           ctx_before, ctx_after, default_layer,
                            seed, output_dir: Path):
-    """2x3 grid: t-SNE with different channel combinations (test set)."""
+    """2x3 grid: t-SNE with different channel combinations (test set).
+
+    Uses ALL test samples for richer, more continuous visualization.
+    """
     setup_style()
     combos = [
         ("M only", ["d620900d_motionSensor"]),
@@ -814,8 +806,7 @@ def fig7_channel_ablation(raw_cfg, pretrained, output_token, device,
         logger.info("  Fig7 %s: loading data + extracting...", name)
 
         try:
-            result = load_data(raw_cfg, split_date=split_date,
-                               channels=channels)
+            result = load_data(raw_cfg, channels=channels)
             sensor_arr, _, test_labels, ch_names, timestamps = result
 
             model = load_mantis(pretrained, layer=default_layer,
@@ -830,19 +821,17 @@ def fig7_channel_ablation(raw_cfg, pretrained, output_token, device,
             if len(Z_te) == 0:
                 raise ValueError("Empty embeddings")
 
-            Z_sub, y_sub, _ = subsample_balanced(Z_te, y_te,
-                                                  max_per_class=400, seed=seed)
-            emb = tsne_2d(Z_sub, seed=seed)
+            logger.info("  Fig7 %s: t-SNE on %d samples...", name, len(Z_te))
+            emb = tsne_2d(Z_te, seed=seed)
             n_ch = len(ch_names)
             embed_d = Z_te.shape[1]
 
             for cls in sorted(CLASS_COLORS):
-                m = y_sub == cls
+                m = y_te == cls
                 if m.any():
                     ax.scatter(emb[m, 0], emb[m, 1], c=CLASS_COLORS[cls],
-                               s=14, alpha=0.55, edgecolors="white",
-                               linewidths=0.15)
-            ax.set_title(f"{name}\n({n_ch}ch, {embed_d}-d, N={len(y_sub)})",
+                               s=6, alpha=0.4, edgecolors="none")
+            ax.set_title(f"{name}\n({n_ch}ch, {embed_d}-d, N={len(y_te)})",
                          fontsize=9, fontweight="bold")
         except Exception as e:
             logger.warning("  Fig7 %s failed: %s", name, e)
@@ -901,7 +890,6 @@ def main():
     pretrained = raw_cfg.get("model", {}).get("pretrained_name",
                                                "paris-noah/MantisV2")
     output_token = "combined"
-    split_date = raw_cfg.get("split_date", "2026-02-15")
     ctx_before = raw_cfg.get("default_context_before", 120)
     ctx_after = raw_cfg.get("default_context_after", 120)
     default_layer = raw_cfg.get("default_layer", 2)
@@ -922,9 +910,9 @@ def main():
     model = load_mantis(pretrained, layer=default_layer,
                         output_token=output_token, device=device)
 
-    # ==== Load data ====
-    logger.info("Loading data with M+C+T1 channels...")
-    result = load_data(raw_cfg, split_date=split_date, channels=CHANNELS_MCT1)
+    # ==== Load data (P4-style split) ====
+    logger.info("Loading data with M+C+T1 channels (P4-style split)...")
+    result = load_data(raw_cfg, channels=CHANNELS_MCT1)
     sensor_arr, train_labels, test_labels, ch_names, timestamps = result
     logger.info("Channels: %s", ch_names)
 
@@ -964,38 +952,30 @@ def main():
         acc_mlp = 100 * (y_test == y_pred_mlp).mean()
         logger.info("MLP Accuracy: %.2f%%", acc_mlp)
 
-    # ==== Pre-compute t-SNE ONCE (consistency across Fig 1/2/4) ====
-    max_viz = 600
-    emb_tr_sub = emb_te_sub = None
-    y_tr_sub = y_te_sub = None
-    te_idx = None
+    # ==== Pre-compute t-SNE ONCE — ALL samples, no subsampling ====
+    emb_tr = emb_te = None
 
     if {1, 2, 4} & figs_to_run:
         logger.info("=" * 60)
-        logger.info("Pre-computing joint t-SNE (train+test, subsampled, "
-                     "reused by Fig 1/2/4)...")
-        Z_tr_sub, y_tr_sub, _ = subsample_balanced(
-            Z_train, y_train, max_per_class=max_viz, seed=args.seed)
-        Z_te_sub, y_te_sub, te_idx = subsample_balanced(
-            Z_test, y_test, max_per_class=max_viz, seed=args.seed)
-        [emb_tr_sub, emb_te_sub] = tsne_2d_joint(
-            Z_tr_sub, Z_te_sub, seed=args.seed)
-        logger.info("Joint t-SNE: train=%s, test=%s",
-                     emb_tr_sub.shape, emb_te_sub.shape)
+        logger.info("Pre-computing joint t-SNE (train=%d + test=%d, ALL "
+                     "samples, reused by Fig 1/2/4)...",
+                     len(Z_train), len(Z_test))
+        [emb_tr, emb_te] = tsne_2d_joint(Z_train, Z_test, seed=args.seed)
+        logger.info("Joint t-SNE complete: train=%s, test=%s",
+                     emb_tr.shape, emb_te.shape)
 
     # ==== Fig 1: Train/Test embedding space ====
     if 1 in figs_to_run:
         logger.info("=" * 60)
         logger.info("Fig 1: Train/Test embedding space...")
-        fig1_train_test_embeddings(emb_tr_sub, y_tr_sub,
-                                     emb_te_sub, y_te_sub, output_dir)
+        fig1_train_test_embeddings(emb_tr, y_train, emb_te, y_test,
+                                     output_dir)
 
     # ==== Fig 2: Classification overlay ====
     if 2 in figs_to_run:
         logger.info("Fig 2: Classification overlay (SVM vs MLP)...")
-        fig2_classification_overlay(
-            emb_te_sub, y_te_sub,
-            y_pred_svm[te_idx], y_pred_mlp[te_idx], output_dir)
+        fig2_classification_overlay(emb_te, y_test,
+                                      y_pred_svm, y_pred_mlp, output_dir)
 
     # ==== Fig 3: Decision boundary ====
     if 3 in figs_to_run:
@@ -1007,9 +987,9 @@ def main():
     if 4 in figs_to_run:
         logger.info("Fig 4: Uncertainty analysis...")
         fig4_uncertainty_analysis(
-            emb_te_sub, y_te_sub,
-            y_prob_svm[te_idx], y_prob_mlp[te_idx],
-            y_pred_svm[te_idx], y_pred_mlp[te_idx], output_dir)
+            emb_te, y_test,
+            y_prob_svm, y_prob_mlp,
+            y_pred_svm, y_pred_mlp, output_dir)
 
     # ==== Fig 5: Layer ablation ====
     if 5 in figs_to_run:
@@ -1031,7 +1011,7 @@ def main():
         logger.info("=" * 60)
         logger.info("Fig 7: Channel ablation...")
         fig7_channel_ablation(raw_cfg, pretrained, output_token, device,
-                               split_date, ctx_before, ctx_after,
+                               ctx_before, ctx_after,
                                default_layer, args.seed, output_dir)
 
     elapsed = time.time() - t0
