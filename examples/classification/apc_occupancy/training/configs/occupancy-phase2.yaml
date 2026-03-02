@@ -13,20 +13,22 @@
 #   - Best sklearn: SVM_rbf → AUC≈0.986, EER≈0.047, Acc≈0.951
 #   - Only output_token="combined" works in MantisV2
 #
-# 3 parallel sweep groups (A/B/C) for 3 GPU servers.
-# Total: ~530 experiments across augmentation, architecture,
-# context, layer, training, TTA, and ensemble.
+# 6 sweep groups (D-I) across 3 GPU servers:
+#   GPU 1: D + E — Augmentation x Head + Context Window (~216 exps)
+#   GPU 2: F + G — Layer Fusion + Training Hyperparams (~170 exps)
+#   GPU 3: H + I — Augmentation Deep Dive + TTA/Ensemble (~138 exps)
+# Total: ~524 experiments.
 #
 # Usage:
 #   cd examples/classification/apc_occupancy
 #
-#   # All groups (sequential, ~12-24h)
+#   # All groups (sequential, ~12-24h on single GPU)
 #   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --device cuda
 #
-#   # Single group on parallel GPU servers
-#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group A --device cuda
-#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group B --device cuda
-#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group C --device cuda
+#   # 3-GPU parallel execution (recommended)
+#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group D E --device cuda
+#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group F G --device cuda
+#   python training/run_phase2_sweep.py --config training/configs/occupancy-phase2.yaml --group H I --device cuda
 
 seed: 42
 output_dir: results/phase2_sweep
