@@ -35,8 +35,9 @@ Six sweep groups reorganized for 3-way parallel execution:
     - Fixed: M+C+T1, 251min
     - Goal: Optimal layer utilization strategy
 
-  Group G — Training Hyperparameters (90 experiments)
+  Group G — Training Hyperparameters (104 experiments)
     - LR x WD grid + optimizer/scheduler + label smoothing + epoch/patience
+    - Batch size sweep + BS×LR interaction
     - Fixed: best defaults
     - Goal: Fine-tune training recipe
 
@@ -50,7 +51,7 @@ Six sweep groups reorganized for 3-way parallel execution:
     - TTA sweep + multi-seed ensemble + hybrid + sklearn baseline
     - Goal: Inference-time boosting + final comparison vs SVM
 
-Total: ~524 experiments across 3 GPU servers (6 groups).
+Total: ~538 experiments across 3 GPU servers (6 groups).
 
 Usage:
   cd examples/classification/apc_occupancy
@@ -79,6 +80,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import json
 import logging
@@ -163,6 +165,7 @@ class TrainConfig:
     scheduler: str = "cosine"      # cosine, step, onecycle, plateau, none
     grad_clip: float = 0.0         # 0 = disabled
     class_weight: list[float] | None = None
+    batch_size: int = 0            # 0 = full-batch, >0 = mini-batch with DataLoader
 
 
 # ============================================================================
@@ -218,6 +221,40 @@ def extract_embeddings(model, dataset: OccupancyDataset, device: str) -> np.ndar
 # Neural training loop (extended)
 # ============================================================================
 
+def _build_optimizer(params, config: TrainConfig):
+    """Build optimizer from config."""
+    if config.optimizer == "adam":
+        return torch.optim.Adam(params, lr=config.lr, weight_decay=config.weight_decay)
+    elif config.optimizer == "sgd":
+        return torch.optim.SGD(params, lr=config.lr, weight_decay=config.weight_decay, momentum=0.9)
+    elif config.optimizer == "rmsprop":
+        return torch.optim.RMSprop(params, lr=config.lr, weight_decay=config.weight_decay)
+    else:  # adamw (default)
+        return torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+
+
+def _build_scheduler(optimizer, config: TrainConfig, steps_per_epoch: int = 1):
+    """Build scheduler from config.
+
+    For OneCycleLR, total_steps = epochs * steps_per_epoch.
+    """
+    total_steps = config.epochs * steps_per_epoch
+    if config.scheduler == "step":
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    elif config.scheduler == "onecycle":
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=config.lr, total_steps=total_steps,
+        )
+    elif config.scheduler == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, patience=10, factor=0.5,
+        )
+    elif config.scheduler == "none":
+        return None
+    else:  # cosine (default)
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+
+
 def train_head(
     head: nn.Module,
     Z_train: torch.Tensor,
@@ -228,7 +265,14 @@ def train_head(
 ) -> nn.Module:
     """Train a classification head on embedding data.
 
-    Full-batch training with configurable optimizer + scheduler.
+    Supports both full-batch and mini-batch training.
+
+    Key improvements over v1:
+      - Mini-batch training via DataLoader (batch_size > 0)
+      - Best model state dict save/restore
+      - No hard-coded loss floor (removed loss < 0.01 early exit)
+      - Correct OneCycleLR total_steps for mini-batch
+      - Per-step scheduler for OneCycleLR, per-epoch for others
     """
     device = torch.device(config.device)
     head = head.to(device)
@@ -239,32 +283,15 @@ def train_head(
     if Z_train_std is not None:
         Z_train_std = Z_train_std.to(device)
 
-    # Optimizer selection
-    params = head.parameters()
-    if config.optimizer == "adam":
-        optimizer = torch.optim.Adam(params, lr=config.lr, weight_decay=config.weight_decay)
-    elif config.optimizer == "sgd":
-        optimizer = torch.optim.SGD(params, lr=config.lr, weight_decay=config.weight_decay, momentum=0.9)
-    elif config.optimizer == "rmsprop":
-        optimizer = torch.optim.RMSprop(params, lr=config.lr, weight_decay=config.weight_decay)
-    else:  # adamw (default)
-        optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+    n_samples = len(Z_train)
+    use_minibatch = config.batch_size > 0 and n_samples > config.batch_size
+    batch_size = config.batch_size if use_minibatch else n_samples
+    steps_per_epoch = math.ceil(n_samples / batch_size) if use_minibatch else 1
 
-    # Scheduler selection
-    if config.scheduler == "step":
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
-    elif config.scheduler == "onecycle":
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=config.lr, total_steps=config.epochs,
-        )
-    elif config.scheduler == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, patience=10, factor=0.5,
-        )
-    elif config.scheduler == "none":
-        scheduler = None
-    else:  # cosine (default)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+    # Optimizer + scheduler
+    optimizer = _build_optimizer(head.parameters(), config)
+    scheduler = _build_scheduler(optimizer, config, steps_per_epoch=steps_per_epoch)
+    is_per_step_scheduler = config.scheduler == "onecycle"
 
     # Loss function
     aug_cfg = config.augmentation or {}
@@ -287,46 +314,80 @@ def train_head(
         )
 
     best_loss = float("inf")
+    best_state = None
     patience_counter = 0
 
     for epoch in range(config.epochs):
+        # Apply epoch-level augmentation (operates on full training set)
         if config.augmentation is not None:
-            Z_aug, y_aug = apply_augmentation(
+            Z_epoch, y_epoch = apply_augmentation(
                 Z_train, y_train, config.augmentation,
                 Z_train_std=Z_train_std,
             )
         else:
-            Z_aug, y_aug = Z_train, y_train
+            Z_epoch, y_epoch = Z_train, y_train
 
-        logits = head(Z_aug)
-        loss = loss_fn(logits, y_aug)
+        if use_minibatch:
+            # Mini-batch training with shuffle
+            perm = torch.randperm(len(Z_epoch), device=device)
+            epoch_loss_sum = 0.0
+            n_batches = 0
 
-        optimizer.zero_grad()
-        loss.backward()
+            for start in range(0, len(Z_epoch), batch_size):
+                idx = perm[start : start + batch_size]
+                Z_batch = Z_epoch[idx]
+                y_batch = y_epoch[idx]
 
-        if config.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(head.parameters(), config.grad_clip)
+                logits = head(Z_batch)
+                loss = loss_fn(logits, y_batch)
 
-        optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                if config.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(head.parameters(), config.grad_clip)
+                optimizer.step()
 
-        if scheduler is not None:
+                if is_per_step_scheduler and scheduler is not None:
+                    scheduler.step()
+
+                epoch_loss_sum += loss.item() * len(idx)
+                n_batches += 1
+
+            epoch_loss = epoch_loss_sum / len(Z_epoch)
+        else:
+            # Full-batch training
+            logits = head(Z_epoch)
+            loss = loss_fn(logits, y_epoch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            if config.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(head.parameters(), config.grad_clip)
+            optimizer.step()
+
+            epoch_loss = loss.item()
+
+        # Per-epoch scheduler step (except OneCycleLR which steps per-batch)
+        if not is_per_step_scheduler and scheduler is not None:
             if config.scheduler == "plateau":
-                scheduler.step(loss.item())
+                scheduler.step(epoch_loss)
             else:
                 scheduler.step()
 
-        loss_val = loss.item()
-
-        if loss_val < best_loss - 1e-5:
-            best_loss = loss_val
+        # Early stopping with best model checkpointing
+        if epoch_loss < best_loss - 1e-5:
+            best_loss = epoch_loss
+            best_state = copy.deepcopy(head.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
 
         if patience_counter >= config.early_stopping_patience:
             break
-        if loss_val < 0.01:
-            break
+
+    # Restore best model
+    if best_state is not None:
+        head.load_state_dict(best_state)
 
     head.eval()
     return head
@@ -387,6 +448,7 @@ def run_neural_train_test(
         scheduler=train_config.scheduler,
         grad_clip=train_config.grad_clip,
         class_weight=train_config.class_weight,
+        batch_size=train_config.batch_size,
     )
 
     # Train fresh head
@@ -416,7 +478,11 @@ def run_neural_train_test_multi_layer(
     train_config: TrainConfig,
     seed: int = 42,
 ) -> tuple[ClassificationMetrics, np.ndarray, np.ndarray]:
-    """Train/test with multi-layer fusion heads."""
+    """Train/test with multi-layer fusion heads.
+
+    Uses TrainConfig optimizer/scheduler settings (no longer hardcoded).
+    Best model state dict is saved and restored after training.
+    """
     from sklearn.preprocessing import StandardScaler
 
     n_classes = len(set(y_train.tolist()) | set(y_test.tolist()))
@@ -440,19 +506,17 @@ def run_neural_train_test_multi_layer(
     head = head.to(device)
     head.train()
 
-    optimizer = torch.optim.AdamW(
-        head.parameters(), lr=train_config.lr,
-        weight_decay=train_config.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=train_config.epochs,
-    )
+    optimizer = _build_optimizer(head.parameters(), train_config)
+    scheduler = _build_scheduler(optimizer, train_config, steps_per_epoch=1)
+    is_per_step_scheduler = train_config.scheduler == "onecycle"
+
     loss_fn = nn.CrossEntropyLoss(label_smoothing=train_config.label_smoothing)
 
     train_inputs = [t.to(device) for t in train_tensors]
     y_train_dev = y_train_t.to(device)
 
     best_loss = float("inf")
+    best_state = None
     patience_counter = 0
 
     for epoch in range(train_config.epochs):
@@ -460,19 +524,32 @@ def run_neural_train_test_multi_layer(
         loss = loss_fn(logits, y_train_dev)
         optimizer.zero_grad()
         loss.backward()
+
+        if train_config.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(head.parameters(), train_config.grad_clip)
+
         optimizer.step()
-        scheduler.step()
+
+        if scheduler is not None:
+            if train_config.scheduler == "plateau":
+                scheduler.step(loss.item())
+            else:
+                scheduler.step()
 
         loss_val = loss.item()
         if loss_val < best_loss - 1e-5:
             best_loss = loss_val
+            best_state = copy.deepcopy(head.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
+
         if patience_counter >= train_config.early_stopping_patience:
             break
-        if loss_val < 0.01:
-            break
+
+    # Restore best model
+    if best_state is not None:
+        head.load_state_dict(best_state)
 
     # Predict
     head.eval()
@@ -1213,12 +1290,12 @@ def run_group_g(
     seed: int,
     output_dir: Path,
 ) -> list[dict]:
-    """Sweep training hyperparameters: LR, WD, optimizer, scheduler, etc.
+    """Sweep training hyperparameters: LR, WD, optimizer, scheduler, batch size, etc.
 
-    ~90 experiments.
+    ~104 experiments (40+15+15+6+8+4+2+8+6).
     """
     logger.info("=" * 70)
-    logger.info("GROUP G: Training Hyperparameters (~90 experiments)")
+    logger.info("GROUP G: Training Hyperparameters (~104 experiments)")
     logger.info("=" * 70)
 
     embed_dim = Z_train.shape[1]
@@ -1404,6 +1481,61 @@ def run_group_g(
                 hf, base_train_config, seed=seed,
             ),
             extra={"group": "G", "subgroup": "batchnorm", "use_batchnorm": use_bn},
+        )
+        results.append(row)
+
+    # Part G8: Batch size sweep = 8
+    logger.info("--- Part G8: Batch size sweep (8 experiments) ---")
+    # With ~8K-10K train samples, mini-batch adds gradient noise regularization
+    batch_sizes = [32, 64, 128, 256, 512, 1024, 2048, 0]  # 0 = full-batch
+    for bs in batch_sizes:
+        exp_idx += 1
+        bs_name = "full" if bs == 0 else str(bs)
+        exp_name = f"BS={bs_name}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        tc = TrainConfig(
+            epochs=base_train_config.epochs,
+            lr=base_train_config.lr, weight_decay=base_train_config.weight_decay,
+            early_stopping_patience=base_train_config.early_stopping_patience,
+            device=base_train_config.device,
+            batch_size=bs,
+        )
+        row = _run_and_log(
+            exp_name,
+            lambda tc_=tc: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, tc_, seed=seed,
+            ),
+            extra={"group": "G", "subgroup": "batch_size", "batch_size": bs},
+        )
+        results.append(row)
+
+    # Part G9: Batch size + LR interaction = 6
+    logger.info("--- Part G9: Batch size x LR interaction (6 experiments) ---")
+    bs_lr_combos = [
+        (64, 5e-4), (64, 1e-3), (64, 5e-3),
+        (256, 5e-4), (256, 1e-3), (256, 5e-3),
+    ]
+    for bs, lr in bs_lr_combos:
+        exp_idx += 1
+        exp_name = f"BS={bs}_LR={lr:.0e}"
+        logger.info("[%d] %s", exp_idx, exp_name)
+
+        tc = TrainConfig(
+            epochs=base_train_config.epochs,
+            lr=lr, weight_decay=base_train_config.weight_decay,
+            early_stopping_patience=base_train_config.early_stopping_patience,
+            device=base_train_config.device,
+            batch_size=bs,
+        )
+        row = _run_and_log(
+            exp_name,
+            lambda tc_=tc: run_neural_train_test(
+                Z_train, y_train, Z_test, y_test,
+                default_head_factory, tc_, seed=seed,
+            ),
+            extra={"group": "G", "subgroup": "bs_lr", "batch_size": bs, "lr": lr},
         )
         results.append(row)
 
@@ -1943,6 +2075,7 @@ def main():
         label_smoothing=train_raw.get("label_smoothing", 0.0),
         early_stopping_patience=train_raw.get("early_stopping_patience", 30),
         device=device,
+        batch_size=train_raw.get("batch_size", 0),
     )
 
     # Model config

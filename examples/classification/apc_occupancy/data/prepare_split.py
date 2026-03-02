@@ -5,7 +5,7 @@ Single source of truth for creating labeled split files.  Eliminates
 ambiguity by:
 
   1. Computing occupancy labels GLOBALLY (all events across full timeline)
-  2. Splitting at a clean midnight boundary
+  2. Splitting at a configurable timestamp (midnight or exact time)
   3. Embedding labels directly into each CSV
 
 Label convention:
@@ -24,18 +24,31 @@ Each row: time, sensor1, sensor2, ..., sensorN, occupancy_label
 Usage:
   cd examples/classification/apc_occupancy
 
-  # Recommended split (midnight Feb 16)
+  # Default split (midnight Feb 17)
   python data/prepare_split.py \\
       --sensor-csv /path/to/sensor_interval1.csv \\
       --events-csv /path/to/occupancy_events.csv \\
       --output-dir /path/to/output/
 
-  # Custom split date
+  # Custom split date (midnight boundary)
   python data/prepare_split.py \\
       --sensor-csv /path/to/sensor_interval1.csv \\
       --events-csv /path/to/occupancy_events.csv \\
-      --split-date 2026-02-17 \\
+      --split-date 2026-02-16 \\
       --output-dir /path/to/output/
+
+  # Exact split time (e.g. 07:00 to align with daily rhythm)
+  python data/prepare_split.py \\
+      --sensor-csv /path/to/sensor_interval1.csv \\
+      --events-csv /path/to/occupancy_events.csv \\
+      --split-time "2026-02-17 07:00:00" \\
+      --output-dir /path/to/output/
+
+  # Analyze mode: compare multiple split points (no output files)
+  python data/prepare_split.py \\
+      --sensor-csv /path/to/sensor_interval1.csv \\
+      --events-csv /path/to/occupancy_events.csv \\
+      --analyze
 
   # Headerless sensor CSV (read column names from reference file)
   python data/prepare_split.py \\
@@ -225,12 +238,18 @@ def load_events_csv(path: str | Path) -> pd.DataFrame:
 def split_and_save(
     sensor_df: pd.DataFrame,
     labels: np.ndarray,
-    split_date: str,
+    split_point: str | pd.Timestamp,
     output_dir: str | Path,
     base_name: str,
     label_column: str = "occupancy_label",
 ) -> tuple[Path, Path]:
-    """Split labeled sensor data at midnight of split_date and save CSVs.
+    """Split labeled sensor data at split_point and save CSVs.
+
+    Parameters
+    ----------
+    split_point : str or pd.Timestamp
+        Any parseable timestamp. Can be a date ("2026-02-17" → midnight)
+        or an exact time ("2026-02-17 07:00:00").
 
     Returns (train_path, test_path).
     """
@@ -241,14 +260,14 @@ def split_and_save(
     df = sensor_df.copy()
     df[label_column] = labels
 
-    split_dt = pd.Timestamp(split_date)
+    split_dt = pd.Timestamp(split_point)
     train_df = df[df.index < split_dt]
     test_df = df[df.index >= split_dt]
 
     if len(train_df) == 0:
-        raise ValueError(f"Train set is empty with split_date={split_date}")
+        raise ValueError(f"Train set is empty with split_point={split_point}")
     if len(test_df) == 0:
-        raise ValueError(f"Test set is empty with split_date={split_date}")
+        raise ValueError(f"Test set is empty with split_point={split_point}")
 
     train_path = output_dir / f"{base_name}_train_with_occupancy_label.csv"
     test_path = output_dir / f"{base_name}_test_with_occupancy_label.csv"
@@ -266,11 +285,11 @@ def split_and_save(
 def print_stats(
     sensor_df: pd.DataFrame,
     labels: np.ndarray,
-    split_date: str,
+    split_point: str | pd.Timestamp,
     events_df: pd.DataFrame,
 ):
     """Print comprehensive statistics about the split."""
-    split_dt = pd.Timestamp(split_date)
+    split_dt = pd.Timestamp(split_point)
     timestamps = sensor_df.index
 
     tr_mask = timestamps < split_dt
@@ -316,7 +335,12 @@ def print_stats(
     print(f"  Sensor interval:    {interval_str}")
     print(f"  Sensor time range:  {timestamps[0]} ~ {timestamps[-1]}")
     print(f"  Total sensor rows:  {len(timestamps):,}")
-    print(f"  Split date:         {split_date} (midnight)")
+    # Format split label: "YYYY-MM-DD (midnight)" or exact timestamp
+    if split_dt == split_dt.normalize():
+        split_label = f"{split_dt.strftime('%Y-%m-%d')} (midnight)"
+    else:
+        split_label = str(split_dt)
+    print(f"  Split point:        {split_label}")
     print(f"  Split day-of-week:  {split_dt.day_name()}")
     print()
 
@@ -406,6 +430,157 @@ def print_stats(
 
 
 # ============================================================================
+# Split Analysis
+# ============================================================================
+
+def analyze_split_points(
+    sensor_df: pd.DataFrame,
+    labels: np.ndarray,
+    events_df: pd.DataFrame,
+    candidates: list[str] | None = None,
+):
+    """Analyze multiple split point candidates with per-day statistics.
+
+    Prints:
+      1. Per-day breakdown: labeled count, occupied/empty counts, occupancy rate
+      2. Comparison table for each candidate split point:
+         train/test sizes, ratio, class balance
+      3. Context window safety for each candidate
+    """
+    timestamps = sensor_df.index
+
+    if candidates is None:
+        candidates = [
+            "2026-02-15 00:00:00",
+            "2026-02-16 00:00:00",
+            "2026-02-16 07:00:00",
+            "2026-02-17 00:00:00",
+            "2026-02-17 07:00:00",
+            "2026-02-18 00:00:00",
+        ]
+
+    # --- Per-day breakdown ---
+    print()
+    print("=" * 80)
+    print("  PER-DAY STATISTICS (occupancy labels)")
+    print("=" * 80)
+    print()
+    print(f"  {'Date':<12} {'Day':<5} {'Total':>7} {'Labeled':>8} "
+          f"{'Occ(1)':>8} {'Emp(0)':>8} {'Occ%':>7}")
+    print(f"  {'-'*12} {'-'*5} {'-'*7} {'-'*8} {'-'*8} {'-'*8} {'-'*7}")
+
+    dates = sorted(set(timestamps.date))
+    for d in dates:
+        day_mask = np.array([dt.date() == d for dt in timestamps.to_pydatetime()])
+        day_labels = labels[day_mask]
+        n_total = len(day_labels)
+        labeled = day_labels[day_labels >= 0]
+        n_labeled = len(labeled)
+        n_occ = int((labeled == 1).sum())
+        n_emp = int((labeled == 0).sum())
+        occ_pct = 100.0 * n_occ / n_labeled if n_labeled > 0 else 0.0
+        dow = pd.Timestamp(d).strftime("%a")
+        print(f"  {str(d):<12} {dow:<5} {n_total:>7,} {n_labeled:>8,} "
+              f"{n_occ:>8,} {n_emp:>8,} {occ_pct:>6.1f}%")
+
+    total_labeled = int((labels >= 0).sum())
+    total_occ = int((labels == 1).sum())
+    total_emp = int((labels == 0).sum())
+    print(f"  {'TOTAL':<12} {'':5} {len(labels):>7,} {total_labeled:>8,} "
+          f"{total_occ:>8,} {total_emp:>8,} "
+          f"{100*total_occ/total_labeled:.1f}%")
+
+    # --- Split point comparison ---
+    print()
+    print("=" * 80)
+    print("  SPLIT POINT COMPARISON")
+    print("=" * 80)
+    print()
+    print(f"  {'Split Point':<24} {'Tr_Lab':>8} {'Te_Lab':>8} "
+          f"{'Ratio':>8} {'Tr_Occ%':>8} {'Te_Occ%':>8} "
+          f"{'|ΔOcc%|':>8}")
+    print(f"  {'-'*24} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+
+    best_split = None
+    best_balance = float("inf")
+
+    for sp_str in candidates:
+        sp = pd.Timestamp(sp_str)
+        tr_mask = timestamps < sp
+        te_mask = timestamps >= sp
+
+        tr_labels = labels[tr_mask]
+        te_labels = labels[te_mask]
+
+        tr_labeled = tr_labels[tr_labels >= 0]
+        te_labeled = te_labels[te_labels >= 0]
+
+        n_tr = len(tr_labeled)
+        n_te = len(te_labeled)
+        total = n_tr + n_te
+
+        if total == 0 or n_tr == 0 or n_te == 0:
+            print(f"  {sp_str:<24} {'SKIP':>8} {'':>8} {'':>8} {'':>8} {'':>8}")
+            continue
+
+        tr_occ_pct = 100.0 * (tr_labeled == 1).sum() / n_tr
+        te_occ_pct = 100.0 * (te_labeled == 1).sum() / n_te
+        delta_occ = abs(tr_occ_pct - te_occ_pct)
+        ratio_str = f"{100*n_tr/total:.0f}:{100*n_te/total:.0f}"
+
+        print(f"  {sp_str:<24} {n_tr:>8,} {n_te:>8,} "
+              f"{ratio_str:>8} {tr_occ_pct:>7.1f}% {te_occ_pct:>7.1f}% "
+              f"{delta_occ:>7.1f}%")
+
+        # Track best balance (smallest |ΔOcc%|, with minimum test set size)
+        if n_te >= 1000 and delta_occ < best_balance:
+            best_balance = delta_occ
+            best_split = sp_str
+
+    print()
+    if best_split:
+        print(f"  → Best balanced split (min |ΔOcc%|, test≥1000): {best_split} "
+              f"(|ΔOcc%|={best_balance:.1f}%)")
+
+    # --- Context window safety for top candidates ---
+    print()
+    print("=" * 80)
+    print("  CONTEXT WINDOW SAFETY (test set usability)")
+    print("=" * 80)
+    print()
+
+    ctx_sizes = [5, 30, 60, 120, 200, 360]
+    header_parts = [f"  {'Split Point':<24}"]
+    for ctx in ctx_sizes:
+        header_parts.append(f"ctx={ctx:>3d}")
+    print("  ".join(header_parts))
+    print(f"  {'-'*24} " + "  ".join(["-" * 7] * len(ctx_sizes)))
+
+    for sp_str in candidates:
+        sp = pd.Timestamp(sp_str)
+        te_mask = timestamps >= sp
+        te_labels = labels[te_mask]
+        te_labeled_idx = np.where(te_labels >= 0)[0]
+
+        if len(te_labeled_idx) == 0:
+            continue
+
+        parts = [f"  {sp_str:<24}"]
+        for ctx in ctx_sizes:
+            usable = int(np.sum(
+                (te_labeled_idx >= ctx)
+                & (te_labeled_idx + ctx < len(te_labels))
+            ))
+            pct = 100 * usable / len(te_labeled_idx)
+            parts.append(f"{pct:>5.0f}%{'✓' if pct > 90 else '⚠' if pct > 50 else '✗'}")
+        print("  ".join(parts))
+
+    print()
+    print("=" * 80)
+    print()
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -424,13 +599,22 @@ def main():
         help="Path to occupancy events CSV (time, Status, At-home count)",
     )
     parser.add_argument(
-        "--split-date", default="2026-02-16",
-        help="Split at midnight of this date (default: 2026-02-16). "
+        "--split-date", default="2026-02-17",
+        help="Split at midnight of this date (default: 2026-02-17). "
              "Format: YYYY-MM-DD",
     )
     parser.add_argument(
-        "--output-dir", required=True,
-        help="Directory to save output CSVs",
+        "--split-time", default=None,
+        help="Split at exact timestamp (overrides --split-date). "
+             "Format: 'YYYY-MM-DD HH:MM:SS', e.g. '2026-02-17 07:00:00'",
+    )
+    parser.add_argument(
+        "--analyze", action="store_true",
+        help="Analyze mode: compare multiple split points, no output files",
+    )
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="Directory to save output CSVs (required unless --analyze)",
     )
     parser.add_argument(
         "--columns-from", default=None,
@@ -445,6 +629,10 @@ def main():
         help="Keep raw At-home count instead of binarizing to 0/1",
     )
     args = parser.parse_args()
+
+    # Validate args
+    if not args.analyze and args.output_dir is None:
+        parser.error("--output-dir is required when not in --analyze mode")
 
     print(f"Loading sensor data: {args.sensor_csv}")
     sensor_df = load_sensor_csv(args.sensor_csv, columns_from=args.columns_from)
@@ -467,15 +655,28 @@ def main():
     print(f"  Labeled: {n_labeled:,} / {len(labels):,} "
           f"({100*n_labeled/len(labels):.1f}%)")
 
+    # --- Analyze mode: compare split points and exit ---
+    if args.analyze:
+        analyze_split_points(sensor_df, labels, events_df)
+        return
+
+    # --- Split mode ---
+    # Determine split point: --split-time overrides --split-date
+    if args.split_time:
+        split_point = args.split_time
+        split_label = f"exact time ({args.split_time})"
+    else:
+        split_point = args.split_date
+        split_label = f"midnight {args.split_date}"
+
     # Derive base name from sensor CSV filename
     sensor_stem = Path(args.sensor_csv).stem
-    # Remove common suffixes for cleaner output names
     base_name = sensor_stem
 
-    print(f"\nSplitting at midnight {args.split_date}...")
+    print(f"\nSplitting at {split_label}...")
     train_path, test_path = split_and_save(
         sensor_df, labels,
-        split_date=args.split_date,
+        split_point=split_point,
         output_dir=args.output_dir,
         base_name=base_name,
         label_column=args.label_column,
@@ -483,9 +684,9 @@ def main():
     print(f"  Train: {train_path}")
     print(f"  Test:  {test_path}")
 
-    print_stats(sensor_df, labels, args.split_date, events_df)
+    print_stats(sensor_df, labels, split_point, events_df)
 
-    print(f"Output files:")
+    print(f"\nOutput files:")
     print(f"  {train_path}")
     print(f"  {test_path}")
 
