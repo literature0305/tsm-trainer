@@ -328,13 +328,19 @@ def smote_oversample(
         # Effective k: can't have more neighbors than samples - 1
         k_eff = min(k_neighbors, n_c - 1)
 
-        # Compute pairwise distances within class
-        # (n_c, n_c) distance matrix
-        diffs = Z_c[:, None, :] - Z_c[None, :, :]  # (n_c, n_c, d)
-        dists = np.sqrt((diffs ** 2).sum(axis=2))  # (n_c, n_c)
+        # Memory-safe k-NN using tree-based search.
+        # The previous implementation built a full (n_c, n_c, d) broadcast
+        # tensor for pairwise distances, which requires O(n^2 * d) memory
+        # — e.g. 162 GB for n_c=5286, d=1536 — causing OOM kills.
+        # sklearn NearestNeighbors uses O(n*d) memory via KD-tree/Ball-tree.
+        from sklearn.neighbors import NearestNeighbors
 
-        # For each sample, find k nearest neighbors (exclude self)
-        nn_indices = np.argsort(dists, axis=1)[:, 1:k_eff + 1]  # (n_c, k_eff)
+        nn = NearestNeighbors(
+            n_neighbors=k_eff + 1, algorithm="auto", metric="euclidean",
+        )
+        nn.fit(Z_c)
+        _, nn_all = nn.kneighbors(Z_c)  # (n_c, k_eff+1), col 0 is self
+        nn_indices = nn_all[:, 1:]  # (n_c, k_eff), exclude self
 
         for _ in range(n_synthetic_per_class):
             # Pick a random anchor

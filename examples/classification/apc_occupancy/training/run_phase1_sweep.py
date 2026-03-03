@@ -805,6 +805,23 @@ def generate_visualizations(all_results: list[dict], output_dir: Path):
     # --- 1. Top-K AUC bar chart ---
     try:
         if "auc" in df.columns and df["auc"].notna().any():
+            # Construct experiment label from available columns
+            parts = []
+            if "context" in df.columns:
+                parts.append(df["context"].astype(str))
+            if "layer" in df.columns:
+                parts.append("L" + df["layer"].astype(str))
+            if "channels" in df.columns:
+                parts.append(df["channels"].astype(str))
+            if "classifier" in df.columns:
+                parts.append(df["classifier"].astype(str))
+            if parts:
+                df["experiment"] = parts[0]
+                for p in parts[1:]:
+                    df["experiment"] = df["experiment"] + " | " + p
+            else:
+                df["experiment"] = df.index.astype(str)
+
             fig = plot_sweep_bar(
                 df, group_col="experiment", metric_col="auc",
                 hue_col="classifier", title="Phase 1 — Top 20 by AUC",
