@@ -85,8 +85,8 @@ DPI = 300
 
 # CSV filename map: group letter -> expected filename stem
 CSV_FILENAMES = {
-    "A": "group_a_context_deep",
-    "B": "group_b_channel_context",
+    "A": "group_a_context_sweep",
+    "B": "group_b_channel_sweep",
     "C": "group_c_classifier_layer",
     "D": "group_d_aug_head",
     "E": "group_e_context",
