@@ -458,25 +458,33 @@ _POOL: VariatePool | None = None
 _WORKER_CFG: dict = {}
 _VARIATE_CACHE: list[np.ndarray] | None = None
 
+# Shared state built once in the parent process before Pool() fork.
+# After fork, worker processes inherit these via Linux CoW — no re-allocation
+# or NFS I/O happens in worker init when these are populated.
+_SHARED_POOL: VariatePool | None = None
+_SHARED_CACHE: list[np.ndarray] | None = None
+
 
 def _prefetch_variate_cache(
-    pool: VariatePool, min_length: int, cache_size: int
+    pool: VariatePool, min_length: int, cache_size: int, seed: int = 42
 ) -> list[np.ndarray]:
-    """Bulk-load variates into worker-local RAM using Arrow batch read.
+    """Bulk-load variates into RAM using Arrow batch read, shared via CoW fork.
 
-    With many workers on NFS, per-sample random Arrow row access (ds[row_idx])
-    causes severe IOPS contention: each seek takes 10–50 ms and 100 workers
-    × 4–8 fetches/sample easily saturates the NFS server.
+    Called ONCE in the parent process before Pool() is created.  All worker
+    processes inherit the resulting list via Linux Copy-on-Write fork — the
+    data pages are never physically copied as long as workers only read (which
+    they do: _fetch_variate only calls list.__getitem__).
 
-    This function issues one ds[list_of_indices] batch call per dataset — Arrow
-    reads a contiguous slice of the file, which is 10–100× faster than the
-    equivalent number of random seeks.  After init, all variate fetches come
-    from this in-process list (~0.001 ms each), eliminating per-sample NFS I/O.
+    Replaces the old per-worker pattern where N workers each spent 10–60 s
+    issuing batch reads against NFS, consuming N × cache_size × avg_len × 8
+    bytes of RAM independently.  With CoW sharing the cost is 1× regardless
+    of worker count.
 
-    Each worker is seeded by its PID so workers draw different subsets.
+    Arrow batch read (ds[list_of_indices]) reads a contiguous file slice —
+    10–100× faster than the equivalent number of random seeks — so even the
+    one-time parent cost is low.
     """
-    import os
-    rng = np.random.default_rng(os.getpid())
+    rng = np.random.default_rng(seed)
     cache: list[np.ndarray] = []
 
     for ds, n_var, valid_rows, target_keys, cum_lo, cum_hi in zip(
@@ -519,9 +527,7 @@ def _prefetch_variate_cache(
 
 
 def _worker_init(data_paths: list[str], cfg: dict) -> None:
-    import os, time
-    # Stagger worker NFS init: spread across 0–6 s in 20 buckets of 0.3 s
-    time.sleep((os.getpid() % 20) * 0.3)
+    import os
 
     # Clamp BLAS/OpenMP to 1 thread per worker (same rationale as kernel synth).
     try:
@@ -531,8 +537,23 @@ def _worker_init(data_paths: list[str], cfg: dict) -> None:
         for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
                    "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             os.environ[_v] = "1"
+
     global _POOL, _WORKER_CFG, _VARIATE_CACHE
     _WORKER_CFG = cfg
+
+    # ── Fast path: parent pre-built pool + cache before fork ─────────────────
+    # Workers inherit _SHARED_POOL and _SHARED_CACHE via CoW — no NFS I/O,
+    # no re-allocation.  Simply bind the module-level aliases and return.
+    if _SHARED_POOL is not None:
+        _POOL = _SHARED_POOL
+        _VARIATE_CACHE = _SHARED_CACHE
+        return
+
+    # ── Fallback: shared state unavailable (e.g. spawn context) ─────────────
+    # Re-build pool and cache independently in each worker.
+    # Stagger NFS access to avoid thundering-herd on the file server.
+    import time
+    time.sleep((os.getpid() % 20) * 0.3)
     precomputed_meta = cfg.get("precomputed_meta")
     _POOL = VariatePool(data_paths, cfg["min_length"], precomputed_meta=precomputed_meta)
     cache_size = cfg.get("variate_cache_size", 5000)
@@ -1039,8 +1060,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_workers",   type=int,   default=None,
                    help="Worker processes (default: cpu_count)")
     p.add_argument("--variate_cache_size", type=int, default=5000,
-                   help="Variates to pre-load per worker into RAM at init using "
-                        "Arrow batch read (eliminates per-sample NFS random seeks). "
+                   help="Variates to pre-load into RAM in the parent process before "
+                        "fork. All workers share this cache via CoW — cost is 1× "
+                        "regardless of worker count (previously N_workers×). "
                         "Increase for more diversity; set 0 to disable (default: 5000)")
     p.add_argument("--min_length",  type=int,   default=64,
                    help="Minimum output series length (default: 64)")
@@ -1087,29 +1109,51 @@ def main() -> None:
     logger.info("  max_tokens=%d  noise_scale=%.2f  uncorr_ratio=%.3f",
                 args.max_tokens, args.noise_scale, args.uncorrelated_ratio)
 
-    # Log pool info once before launching per-dim pools
+    # ── Build shared pool + cache in parent before fork ──────────────────────
+    # The pool and variate cache are built ONCE here, then all worker processes
+    # inherit them via Linux CoW fork.  Workers skip re-building (_worker_init
+    # fast path).  Memory cost: 1× instead of N_workers×.
     import gc
-    logger.info("Scanning input datasets:")
-    _dummy = VariatePool(args.data_paths, args.min_length)
-    logger.info("Total variate pool size: %d", _dummy.total)
 
-    # Build precomputed_meta so workers skip NFS detect calls
-    _path_to_ds_idx = {p: i for i, p in enumerate(_dummy._loaded_paths)}
+    global _SHARED_POOL, _SHARED_CACHE
+
+    logger.info("Scanning input datasets (shared pool — built once in parent):")
+    _SHARED_POOL = VariatePool(args.data_paths, args.min_length)
+    logger.info("Total variate pool size: %d", _SHARED_POOL.total)
+
+    # Build precomputed_meta for worker fallback path (fast path skips it).
+    _path_to_ds_idx = {p: i for i, p in enumerate(_SHARED_POOL._loaded_paths)}
     precomputed_meta: list[dict | None] = []
     for path in args.data_paths:
         if path in _path_to_ds_idx:
             i = _path_to_ds_idx[path]
             precomputed_meta.append({
-                "target_keys": _dummy._target_keys[i],
-                "n_variates":  _dummy._n_variates[i],
+                "target_keys": _SHARED_POOL._target_keys[i],
+                "n_variates":  _SHARED_POOL._n_variates[i],
             })
         else:
-            precomputed_meta.append(None)  # failed to load
-
-    del _dummy
-    gc.collect()   # release memory before fork so CoW pages are minimised
-
+            precomputed_meta.append(None)
     cfg["precomputed_meta"] = precomputed_meta
+
+    # Pre-load variate cache in parent; workers inherit via CoW fork.
+    # N_workers × (cache_size × avg_len × 8B) → 1× regardless of worker count.
+    if args.variate_cache_size > 0:
+        logger.info(
+            "Pre-loading shared variate cache (%d variates, seed=%d) ...",
+            args.variate_cache_size, args.seed,
+        )
+        t_cache = time.time()
+        _SHARED_CACHE = _prefetch_variate_cache(
+            _SHARED_POOL, args.min_length, args.variate_cache_size, seed=args.seed
+        )
+        logger.info(
+            "Shared cache ready: %d variates loaded in %.1fs",
+            len(_SHARED_CACHE), time.time() - t_cache,
+        )
+    else:
+        _SHARED_CACHE = None
+
+    gc.collect()   # compact heap before fork to minimise CoW dirty pages
     tmp_dirs: dict[int, Path] = {}
     out_paths: dict[int, Path] = {}
     for d in dims:
