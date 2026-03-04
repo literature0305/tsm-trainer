@@ -1,0 +1,140 @@
+# ===========================================================================
+# Chronos-2 Base (120M) — Single GPU Config (RTX 2080 Ti, 11GB)
+# ===========================================================================
+# Derived from chronos2-base.yaml with:
+#   - FSDP disabled (not supported in single-process mode)
+#   - DDP disabled (single GPU)
+#   - per_device_train_batch_size reduced to fit 11GB VRAM
+#   - gradient_accumulation_steps to compensate for smaller batch
+#
+# Effective global batch = per_device_batch_size × grad_accum = 4 × 64 = 256
+# (vs. 1024 × 64 GPUs = 65536 in full pretraining — learning dynamics differ)
+#
+# Usage:
+#   python3 scripts/forecasting/training/train_chronos2.py \
+#       --config scripts/forecasting/training/configs/chronos2-base-single-gpu.yaml
+# ===========================================================================
+
+# ===========================================================================
+# Model Architecture (same as chronos2-base.yaml)
+# ===========================================================================
+d_model: 768
+d_kv: 64
+d_ff: 3072
+num_layers: 12
+num_heads: 12
+dropout_rate: 0.1
+layer_norm_epsilon: 1.0e-6
+initializer_factor: 0.05
+feed_forward_proj: "relu"
+dense_act_fn: "relu"
+rope_theta: 10000.0
+attn_implementation: "sdpa"
+
+# ===========================================================================
+# Forecasting Config
+# ===========================================================================
+context_length: 2048
+input_patch_size: 16
+input_patch_stride: 16
+output_patch_size: 16
+prediction_length: 64
+max_output_patches: 64
+use_reg_token: true
+use_arcsinh: true
+time_encoding_scale: 8192
+
+quantiles:
+  - 0.01
+  - 0.05
+  - 0.1
+  - 0.15
+  - 0.2
+  - 0.25
+  - 0.3
+  - 0.35
+  - 0.4
+  - 0.45
+  - 0.5
+  - 0.55
+  - 0.6
+  - 0.65
+  - 0.7
+  - 0.75
+  - 0.8
+  - 0.85
+  - 0.9
+  - 0.95
+  - 0.99
+
+# ===========================================================================
+# Model Initialization
+# ===========================================================================
+random_init: true
+
+# ===========================================================================
+# Training Data
+# ===========================================================================
+training_data_paths:
+  - "/group-volume/ts-dataset/chronos_datasets/training_corpus_tsmixup_10m"
+  - "/group-volume/ts-dataset/chronos_datasets/training_corpus_kernel_synth_1m"
+probability:
+  - 0.9
+  - 0.1
+
+max_train_series: 1_000_000
+min_past: 60
+
+# ===========================================================================
+# Training Hyperparameters
+# ===========================================================================
+max_steps: 200_000
+# RTX 2080 Ti 11GB: batch=4 fits with context=2048 + grad_checkpointing
+per_device_train_batch_size: 32
+# grad_accum=64 → effective batch=256 per step
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-4
+lr_scheduler_type: "cosine"
+warmup_ratio: 0.01
+weight_decay: 0.01
+max_grad_norm: 1.0
+optim: "adamw_torch_fused"
+seed: 42
+
+# ===========================================================================
+# Saving & Logging
+# ===========================================================================
+output_dir: "./outputs/chronos2-base-single-gpu"
+save_steps: 500
+log_steps: 50
+save_total_limit: 3
+report_to: "tensorboard"
+health_report_interval: 500
+
+# ===========================================================================
+# Benchmark Evaluation
+# ===========================================================================
+benchmark_config: "scripts/forecasting/evaluation/configs/chronos-lite.yaml"
+benchmark_eval_steps: 500
+benchmark_top_k_checkpoints: 3
+benchmark_batch_size: 64
+benchmark_checkpoint_metric: "composite"
+benchmark_composite_weights:
+  wql: 0.6
+  mase: 0.4
+
+benchmark_datasets_root: "/group-volume/ts-dataset/benchmarks/chronos"
+benchmark_eval_timeout: 600
+
+# ===========================================================================
+# Performance
+# ===========================================================================
+dataloader_num_workers: 4
+torch_compile: false
+gradient_checkpointing: true   # Essential for 11GB VRAM
+
+# ===========================================================================
+# Distributed — DISABLED for single GPU
+# ===========================================================================
+# fsdp must be empty string (or omitted) for single-process mode
+fsdp: ""
