@@ -79,6 +79,7 @@ NOISE_SCALE=0.35
 NEG_CORR_RATIO=0.35
 HIDDEN_REGIME_RATIO=0.05
 N_WORKERS=""                       # empty → cpu_count inside scripts
+VARIATE_CACHE_SIZE=5000            # variates pre-loaded per worker at init (0=disable)
 SEED=42
 CLEANUP_TMP=""
 SKIP_KERNEL=""
@@ -104,6 +105,7 @@ while [[ $# -gt 0 ]]; do
     --neg_corr_ratio)       NEG_CORR_RATIO="$2";       shift 2 ;;
     --hidden_regime_ratio)  HIDDEN_REGIME_RATIO="$2";  shift 2 ;;
     --n_workers)            N_WORKERS="$2";             shift 2 ;;
+    --variate_cache_size)   VARIATE_CACHE_SIZE="$2";    shift 2 ;;
     --seed)                 SEED="$2";                  shift 2 ;;
     --cleanup_tmp)          CLEANUP_TMP="--cleanup_tmp"; shift ;;
     --skip_kernel)          SKIP_KERNEL="1";            shift ;;
@@ -243,12 +245,13 @@ for i in 0 1 2 3; do
         --min_dim            2 \
         --max_dim            "$MAX_N_DIM" \
         --max_tokens         "$MAX_TOKENS" \
-        --uncorrelated_ratio "$UNCORRELATED_RATIO" \
-        --noise_scale        "$NOISE_SCALE" \
-        --neg_corr_ratio     "$NEG_CORR_RATIO" \
-        --min_length         "$MIN_LEN" \
-        --max_length         "$MAX_LEN" \
-        --seed               "$SEED" \
+        --uncorrelated_ratio   "$UNCORRELATED_RATIO" \
+        --noise_scale          "$NOISE_SCALE" \
+        --neg_corr_ratio       "$NEG_CORR_RATIO" \
+        --min_length           "$MIN_LEN" \
+        --max_length           "$MAX_LEN" \
+        --seed                 "$SEED" \
+        --variate_cache_size   "$VARIATE_CACHE_SIZE" \
         $WORKERS_ARG \
         $CLEANUP_TMP
       echo "     Step 2 done: $(date '+%H:%M:%S')"

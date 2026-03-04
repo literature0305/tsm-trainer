@@ -426,8 +426,17 @@ def _worker_init(cfg: dict) -> None:
     _WORKER_CFG = cfg
 
 
-def generate_one_sample(sample_id: int) -> tuple[int, np.ndarray | None, str]:
-    """Generate one 3D sample.  Returns (sample_id, data | None, method/status)."""
+def generate_one_sample(sample_id: int) -> tuple[int, bool | None, str]:
+    """Generate one 3D sample and write it to the tmp directory.
+
+    Workers write directly to NFS instead of returning large arrays through
+    IPC.  This parallelises disk I/O across all workers and eliminates the
+    single-threaded savez_compressed bottleneck in the main process.
+
+    Returns (sample_id, True | None, method/status):
+      True  — sample written to <tmp_dir>/sample_<id>.npz
+      None  — sample rejected; status contains the reason
+    """
     cfg = _WORKER_CFG
     rng = np.random.default_rng(cfg["base_seed"] + sample_id * 7_919)
     max_length = cfg["max_length"]
@@ -480,7 +489,12 @@ def generate_one_sample(sample_id: int) -> tuple[int, np.ndarray | None, str]:
         if np.any(np.var(Y, axis=1) < 1e-12):
             return sample_id, None, "zero_variance"
 
-        return sample_id, Y.astype(np.float64), method
+        # ── Write directly from worker (parallel NFS writes) ────────────────
+        np.savez_compressed(
+            Path(cfg["tmp_dir"]) / f"sample_{sample_id:08d}.npz",
+            target=Y.astype(np.float64),
+        )
+        return sample_id, True, method
 
     except Exception as exc:   # noqa: BLE001
         return sample_id, None, f"error:{exc}"
@@ -646,6 +660,7 @@ def main() -> None:
         "uncorrelated_ratio":  args.uncorrelated_ratio,
         "hidden_regime_ratio": args.hidden_regime_ratio,
         "base_seed":           args.seed,
+        "tmp_dir":             str(tmp_dir),  # workers write directly (parallel I/O)
     }
 
     skipped = Counter()
@@ -661,14 +676,11 @@ def main() -> None:
             batch_ids = list(range(next_id, next_id + batch_size))
             next_id += batch_size
 
-            for sample_id, data, status in pool.imap_unordered(
-                generate_one_sample, batch_ids, chunksize=max(1, batch_size // (n_workers * 4))
+            chunksize = max(1, batch_size // (n_workers * 4))
+            for sample_id, wrote, status in pool.imap_unordered(
+                generate_one_sample, batch_ids, chunksize=chunksize
             ):
-                if data is not None and n_valid < args.n_datasets:
-                    np.savez_compressed(
-                        tmp_dir / f"sample_{sample_id:08d}.npz",
-                        target=data,
-                    )
+                if wrote is True and n_valid < args.n_datasets:
                     n_valid += 1
                     method_counts[status] += 1
                     if n_valid % max(1, args.n_datasets // 20) == 0:
@@ -677,7 +689,7 @@ def main() -> None:
                         eta = (args.n_datasets - n_valid) / max(rate, 1e-9)
                         logger.info("  %d / %d  (%.0f samples/s, ETA %.0fs)",
                                     n_valid, args.n_datasets, rate, eta)
-                elif data is None:
+                elif wrote is None:
                     skipped[status] += 1
 
     logger.info("Generation complete in %.1f s", time.time() - t0)

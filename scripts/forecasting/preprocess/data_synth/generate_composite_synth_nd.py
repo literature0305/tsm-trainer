@@ -331,15 +331,75 @@ def _pick_k_h(n_dim: int, rng: np.random.Generator) -> tuple[int, int]:
 
 _POOL: VariatePool | None = None
 _WORKER_CFG: dict = {}
+_VARIATE_CACHE: list[np.ndarray] | None = None
+
+
+def _prefetch_variate_cache(
+    pool: VariatePool, min_length: int, cache_size: int
+) -> list[np.ndarray]:
+    """Bulk-load variates into worker-local RAM using Arrow batch read.
+
+    With many workers on NFS, per-sample random Arrow row access (ds[row_idx])
+    causes severe IOPS contention: each seek takes 10–50 ms and 100 workers
+    × 4–8 fetches/sample easily saturates the NFS server.
+
+    This function issues one ds[list_of_indices] batch call per dataset — Arrow
+    reads a contiguous slice of the file, which is 10–100× faster than the
+    equivalent number of random seeks.  After init, all variate fetches come
+    from this in-process list (~0.001 ms each), eliminating per-sample NFS I/O.
+
+    Each worker is seeded by its PID so workers draw different subsets.
+    """
+    import os
+    rng = np.random.default_rng(os.getpid())
+    cache: list[np.ndarray] = []
+
+    for ds, n_var, valid_rows, cum_lo, cum_hi in zip(
+        pool._datasets, pool._n_variates, pool._valid_rows,
+        pool._cum[:-1], pool._cum[1:],
+    ):
+        pool_size = cum_hi - cum_lo
+        n_from_ds = max(1, round(cache_size * pool_size / pool.total))
+        n_from_ds = min(n_from_ds, len(valid_rows))
+
+        chosen_ranks = rng.choice(len(valid_rows), size=n_from_ds, replace=False)
+        row_indices = [int(valid_rows[r]) for r in chosen_ranks]
+
+        try:
+            # Batch read: Arrow take() — far faster than n_from_ds individual reads
+            batch = ds[row_indices]
+            for tgt in batch["target"]:
+                arr = np.asarray(tgt, dtype=np.float64)
+                if arr.ndim == 1:
+                    if len(arr) >= min_length and np.isfinite(arr).all():
+                        cache.append(arr)
+                elif arr.ndim == 2:
+                    for k in range(arr.shape[0]):
+                        row = arr[k]
+                        if len(row) >= min_length and np.isfinite(row).all():
+                            cache.append(row)
+        except Exception:
+            pass
+
+    return cache
 
 
 def _worker_init(data_paths: list[str], cfg: dict) -> None:
-    global _POOL, _WORKER_CFG
+    global _POOL, _WORKER_CFG, _VARIATE_CACHE
     _WORKER_CFG = cfg
     _POOL = VariatePool(data_paths, cfg["min_length"])
+    cache_size = cfg.get("variate_cache_size", 5000)
+    if cache_size > 0:
+        _VARIATE_CACHE = _prefetch_variate_cache(_POOL, cfg["min_length"], cache_size)
+    else:
+        _VARIATE_CACHE = None
 
 
 def _fetch_variate(rng: np.random.Generator, max_attempts: int = 40) -> np.ndarray | None:
+    # Fast path: serve from worker-local RAM cache (no NFS I/O)
+    if _VARIATE_CACHE:
+        return _VARIATE_CACHE[int(rng.integers(0, len(_VARIATE_CACHE)))]
+    # Fallback: direct pool access (used when variate_cache_size=0)
     for _ in range(max_attempts):
         idx = int(rng.integers(0, _POOL.total))
         v = _POOL.get_variate(idx)
@@ -452,9 +512,18 @@ def _synthesize_variate(
 
 
 def generate_composite_sample_nd(task: tuple) -> tuple:
-    """Worker: generate one composite sample for the given n_dim.
+    """Worker: generate one composite sample and write it directly to disk.
 
-    Returns ((sample_id, n_dim), data_array | None, status_string).
+    Writing from the worker (rather than sending the array back through IPC and
+    writing in the main process) provides two benefits:
+      1. NFS writes are parallelised across all workers instead of being
+         serialised through the main process.
+      2. Eliminates pickling/unpickling of large numpy arrays through pipes
+         (up to ~1 MB per sample for high-dim, long series).
+
+    Returns ((sample_id, n_dim), True | None, status_string):
+      True  — sample written to <tmp_dirs[n_dim]>/sample_<id>.npz
+      None  — sample rejected; status contains the reason
     """
     sample_id, n_dim = task
     cfg = _WORKER_CFG
@@ -529,7 +598,15 @@ def generate_composite_sample_nd(task: tuple) -> tuple:
         if np.any(np.var(Y, axis=1) < 1e-12):
             return (sample_id, n_dim), None, "zero_variance"
 
-        return (sample_id, n_dim), Y, last_method
+        # ── Write directly from worker (parallel I/O, no IPC array transfer) ──
+        tmp_dirs = _WORKER_CFG.get("tmp_dirs")
+        if tmp_dirs is not None:
+            np.savez_compressed(
+                Path(tmp_dirs[n_dim]) / f"sample_{sample_id:08d}.npz",
+                target=Y,
+            )
+            return (sample_id, n_dim), True, last_method
+        return (sample_id, n_dim), Y, last_method  # fallback (tmp_dirs not set)
 
     except Exception as exc:
         return (sample_id, n_dim), None, f"error:{exc}"
@@ -814,6 +891,10 @@ def parse_args() -> argparse.Namespace:
                         "with their sources (default: 0.35)")
     p.add_argument("--n_workers",   type=int,   default=None,
                    help="Worker processes (default: cpu_count)")
+    p.add_argument("--variate_cache_size", type=int, default=5000,
+                   help="Variates to pre-load per worker into RAM at init using "
+                        "Arrow batch read (eliminates per-sample NFS random seeks). "
+                        "Increase for more diversity; set 0 to disable (default: 5000)")
     p.add_argument("--min_length",  type=int,   default=64,
                    help="Minimum output series length (default: 64)")
     p.add_argument("--max_length",  type=int,   default=8_192,
@@ -842,6 +923,8 @@ def main() -> None:
         "noise_scale":         args.noise_scale,
         "neg_corr_ratio":      args.neg_corr_ratio,
         "base_seed":           args.seed,
+        "variate_cache_size":  args.variate_cache_size,
+        # tmp_dirs added below after path setup (workers write npz directly)
     }
 
     # ── Compute per-dim sample count ────────────────────────────────────────
@@ -869,6 +952,9 @@ def main() -> None:
         out_paths[d] = output_dir / tag
         tmp_dirs[d] = output_dir / (tag + "_tmp")
         tmp_dirs[d].mkdir(parents=True, exist_ok=True)
+
+    # Pass tmp_dirs to workers so they can write npz files directly
+    cfg["tmp_dirs"] = {d: str(tmp_dirs[d]) for d in dims}
 
     stats_by_dim: dict[int, dict] = {}
     method_counts_by_dim: dict[int, Counter] = {}
@@ -930,14 +1016,11 @@ def main() -> None:
                         next_id[d] += bs
 
                 chunksize = max(1, len(batch) // (n_workers * 4))
-                for (sid, d), data, status in pool.imap_unordered(
+                for (sid, d), wrote, status in pool.imap_unordered(
                     generate_composite_sample_nd, batch, chunksize=chunksize
                 ):
-                    if data is not None and n_valid[d] < n_per_dim:
-                        np.savez_compressed(
-                            tmp_dirs[d] / f"sample_{sid:08d}.npz",
-                            target=data,
-                        )
+                    if wrote is True and n_valid[d] < n_per_dim:
+                        # Worker already wrote the file; just update counter
                         n_valid[d] += 1
                         method_cnts[d][status] += 1
                         if n_valid[d] % max(1, n_per_dim // 20) == 0:
@@ -951,7 +1034,16 @@ def main() -> None:
                                 d, n_valid[d], n_per_dim, rate, eta,
                                 total, n_per_dim * len(dims_todo),
                             )
-                    elif data is None:
+                    elif wrote is not None and wrote is not True:
+                        # Backward-compat: wrote is a numpy array (tmp_dirs not in cfg)
+                        if n_valid[d] < n_per_dim:
+                            np.savez_compressed(
+                                tmp_dirs[d] / f"sample_{sid:08d}.npz",
+                                target=wrote,
+                            )
+                            n_valid[d] += 1
+                            method_cnts[d][status] += 1
+                    else:
                         skip_cnts[d][status] += 1
 
         logger.info("Generation done in %.1fs", time.time() - t_total)
