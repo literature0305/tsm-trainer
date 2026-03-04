@@ -59,6 +59,16 @@
 # =============================================================================
 set -euo pipefail
 
+# ── Prevent BLAS/OpenMP thread oversubscription ───────────────────────────────
+# numpy/OpenBLAS spawns cpu_count() threads per worker by default.
+# With N workers on a 100-CPU machine: N workers × 100 BLAS threads = N×100
+# threads competing → excessive context switching → slower than 8-CPU local.
+# Setting to 1 makes each worker use exactly 1 CPU; tune n_workers instead.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_SYNTH_DIR="${SCRIPT_DIR}/data_synth"
 PYTHON="${PYTHON:-/root/miniconda3/envs/tsm/bin/python}"

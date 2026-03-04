@@ -84,6 +84,56 @@ SYNTH_METHODS = [
 # Variate Pool
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _detect_target_keys(ds) -> list[str]:
+    """Detect which columns to use as variates.
+
+    Returns ``["target"]`` if the dataset has a ``target`` column.
+    Otherwise, finds all columns that contain numeric sequences (list of numbers)
+    and returns them — each column becomes one variate (useful for wide-format
+    datasets like ETTh/ETTm where each column is a separate channel).
+    """
+    import pyarrow as pa
+
+    features = ds.features
+    if "target" in features:
+        return ["target"]
+
+    # Fall back: find all numeric-sequence columns via schema inspection
+    numeric_keys: list[str] = []
+    schema = ds.data.schema
+    for i in range(len(schema)):
+        field = schema.field(i)
+        ft = field.type
+        # Accept list/large_list of numeric scalars
+        if pa.types.is_list(ft) or pa.types.is_large_list(ft):
+            vt = ft.value_type
+            if (
+                pa.types.is_floating(vt)
+                or pa.types.is_integer(vt)
+                or pa.types.is_decimal(vt)
+            ):
+                numeric_keys.append(field.name)
+
+    if numeric_keys:
+        return numeric_keys
+
+    # Last resort: try to inspect the first row's values
+    if len(ds) > 0:
+        row = ds[0]
+        for key, val in row.items():
+            if isinstance(val, (list, np.ndarray)) and len(val) > 0:
+                first = val[0] if isinstance(val, list) else val.flat[0]
+                if isinstance(first, (int, float, np.integer, np.floating)):
+                    numeric_keys.append(key)
+        if numeric_keys:
+            return numeric_keys
+
+    raise ValueError(
+        f"No numeric sequence column found in dataset (columns: {list(features.keys())}). "
+        "Use a dataset with a 'target' column or wide-format numeric columns."
+    )
+
+
 class VariatePool:
     """Random-access pool of 1-D time series drawn from multiple HF Arrow datasets."""
 
@@ -93,6 +143,7 @@ class VariatePool:
         self._datasets: list = []
         self._n_variates: list[int] = []
         self._valid_rows: list[np.ndarray] = []   # pre-filtered row indices per dataset
+        self._target_keys: list[list[str]] = []   # variate column names per dataset
         self._cum: list[int] = [0]
         self._min_length = min_length
 
@@ -104,8 +155,14 @@ class VariatePool:
                 logger.warning("Cannot load %s: %s — skipping.", path, exc)
                 continue
 
-            n_var = _detect_n_variates(ds)
-            valid = _build_length_filter(ds, min_length, n_var)
+            try:
+                target_keys = _detect_target_keys(ds)
+            except ValueError as exc:
+                logger.warning("  Pool SKIP %-50s  (%s)", Path(path).name, exc)
+                continue
+
+            n_var = _detect_n_variates(ds, target_keys)
+            valid = _build_length_filter(ds, min_length, n_var, target_keys)
             if len(valid) == 0:
                 logger.warning(
                     "  Pool SKIP %-50s  (no rows with length >= %d)",
@@ -117,9 +174,10 @@ class VariatePool:
             self._datasets.append(ds)
             self._n_variates.append(n_var)
             self._valid_rows.append(valid)
+            self._target_keys.append(target_keys)
             self._cum.append(self._cum[-1] + pool_size)
-            logger.info("  Pool +  %-55s  valid=%d/%d  variates/row=%d",
-                        Path(path).name, len(valid), len(ds), n_var)
+            logger.info("  Pool +  %-55s  valid=%d/%d  variates/row=%d  keys=%s",
+                        Path(path).name, len(valid), len(ds), n_var, target_keys[:4])
 
         if self.total == 0:
             raise RuntimeError("Variate pool is empty — check --data_paths.")
@@ -140,12 +198,21 @@ class VariatePool:
         local = global_idx - self._cum[ds_idx]
         n_var = self._n_variates[ds_idx]
         valid_rows = self._valid_rows[ds_idx]
+        target_keys = self._target_keys[ds_idx]
         local_row_rank, var_idx = divmod(local, n_var)
         row_idx = int(valid_rows[local_row_rank % len(valid_rows)])
         try:
             row = self._datasets[ds_idx][row_idx]
-            tgt = np.array(row["target"], dtype=np.float64)
-            series = tgt if tgt.ndim == 1 else (tgt[var_idx] if tgt.ndim == 2 else None)
+            if len(target_keys) == 1:
+                # Single-key mode: "target" column may be 1-D or 2-D (multivariate)
+                tgt = np.array(row[target_keys[0]], dtype=np.float64)
+                series = tgt if tgt.ndim == 1 else (tgt[var_idx] if tgt.ndim == 2 else None)
+            else:
+                # Multi-key mode: each column is one variate
+                key = target_keys[var_idx % len(target_keys)]
+                series = np.array(row[key], dtype=np.float64)
+                if series.ndim != 1:
+                    series = None
             if series is None or len(series) < self._min_length:
                 return None
             if np.any(np.isnan(series)) or np.any(np.isinf(series)):
@@ -155,10 +222,15 @@ class VariatePool:
             return None
 
 
-def _detect_n_variates(ds) -> int:
+def _detect_n_variates(ds, target_keys: list[str]) -> int:
+    """Return the number of 1-D variates per row for the given column keys."""
     if len(ds) == 0:
         return 1
-    sample = ds[0]["target"]
+    if len(target_keys) > 1:
+        # Multi-key wide format: one variate per key
+        return len(target_keys)
+    # Single-key: check whether the column stores a 2-D (multivariate) array
+    sample = ds[0][target_keys[0]]
     if isinstance(sample, (list, np.ndarray)) and len(sample) > 0:
         first = sample[0]
         if isinstance(first, (list, np.ndarray)):
@@ -166,22 +238,24 @@ def _detect_n_variates(ds) -> int:
     return 1
 
 
-def _build_length_filter(ds, min_length: int, n_var: int) -> np.ndarray:
+def _build_length_filter(
+    ds, min_length: int, n_var: int, target_keys: list[str]
+) -> np.ndarray:
     """Return row indices where series length >= min_length.
 
-    Fast path: PyArrow vectorized list_size for univariate datasets (O(N) in C).
+    Fast path: PyArrow vectorized list_size for single-key univariate datasets (O(N) in C).
     Fallback:  sample up to 50 K rows for multivariate or on PyArrow error.
     If ALL sampled rows pass, all rows are assumed valid → returns np.arange(len(ds)).
     """
     n_total = len(ds)
 
-    if n_var == 1:
+    if n_var == 1 and len(target_keys) == 1:
         try:
             import pyarrow as pa
             # Read list sizes from offset buffers only — zero data materialisation.
             # Arrow ListArray layout: buffers = [validity, offsets(int32), ...]
             # LargeListArray: offsets are int64.
-            tgt_col = ds.data.column("target")   # ChunkedArray[ListArray]
+            tgt_col = ds.data.column(target_keys[0])   # ChunkedArray[ListArray]
             sizes_parts: list[np.ndarray] = []
             for chunk in tgt_col.chunks:
                 bufs = chunk.buffers()
@@ -198,7 +272,7 @@ def _build_length_filter(ds, min_length: int, n_var: int) -> np.ndarray:
         except Exception:
             pass  # fall through to sampling
 
-    # Sampling fallback (multivariate or PyArrow unavailable)
+    # Sampling fallback (multivariate, multi-key, or PyArrow unavailable)
     n_scan = min(n_total, 50_000)
     rng0 = np.random.default_rng(0)
     sample_idx = (
@@ -206,9 +280,11 @@ def _build_length_filter(ds, min_length: int, n_var: int) -> np.ndarray:
         if n_scan < n_total else np.arange(n_total)
     )
     valid: list[int] = []
+    # Use first key; for multi-key datasets all columns have the same row length
+    check_key = target_keys[0]
     for idx in sample_idx:
         try:
-            tgt = np.array(ds[int(idx)]["target"], dtype=np.float64)
+            tgt = np.array(ds[int(idx)][check_key], dtype=np.float64)
             if tgt.shape[-1] >= min_length:
                 valid.append(int(idx))
         except Exception:
@@ -354,8 +430,8 @@ def _prefetch_variate_cache(
     rng = np.random.default_rng(os.getpid())
     cache: list[np.ndarray] = []
 
-    for ds, n_var, valid_rows, cum_lo, cum_hi in zip(
-        pool._datasets, pool._n_variates, pool._valid_rows,
+    for ds, n_var, valid_rows, target_keys, cum_lo, cum_hi in zip(
+        pool._datasets, pool._n_variates, pool._valid_rows, pool._target_keys,
         pool._cum[:-1], pool._cum[1:],
     ):
         pool_size = cum_hi - cum_lo
@@ -368,16 +444,25 @@ def _prefetch_variate_cache(
         try:
             # Batch read: Arrow take() — far faster than n_from_ds individual reads
             batch = ds[row_indices]
-            for tgt in batch["target"]:
-                arr = np.asarray(tgt, dtype=np.float64)
-                if arr.ndim == 1:
-                    if len(arr) >= min_length and np.isfinite(arr).all():
-                        cache.append(arr)
-                elif arr.ndim == 2:
-                    for k in range(arr.shape[0]):
-                        row = arr[k]
-                        if len(row) >= min_length and np.isfinite(row).all():
-                            cache.append(row)
+            if len(target_keys) == 1:
+                # Single-key mode: "target" may be 1-D or 2-D per row
+                for tgt in batch[target_keys[0]]:
+                    arr = np.asarray(tgt, dtype=np.float64)
+                    if arr.ndim == 1:
+                        if len(arr) >= min_length and np.isfinite(arr).all():
+                            cache.append(arr)
+                    elif arr.ndim == 2:
+                        for k in range(arr.shape[0]):
+                            row_arr = arr[k]
+                            if len(row_arr) >= min_length and np.isfinite(row_arr).all():
+                                cache.append(row_arr)
+            else:
+                # Multi-key wide format: each key is one variate column
+                for key in target_keys:
+                    for tgt in batch[key]:
+                        arr = np.asarray(tgt, dtype=np.float64)
+                        if arr.ndim == 1 and len(arr) >= min_length and np.isfinite(arr).all():
+                            cache.append(arr)
         except Exception:
             pass
 
@@ -385,6 +470,15 @@ def _prefetch_variate_cache(
 
 
 def _worker_init(data_paths: list[str], cfg: dict) -> None:
+    # Clamp BLAS/OpenMP to 1 thread per worker (same rationale as kernel synth).
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(limits=1)
+    except ImportError:
+        import os
+        for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                   "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[_v] = "1"
     global _POOL, _WORKER_CFG, _VARIATE_CACHE
     _WORKER_CFG = cfg
     _POOL = VariatePool(data_paths, cfg["min_length"])

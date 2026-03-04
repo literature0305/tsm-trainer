@@ -422,6 +422,19 @@ def _add_trend_seasonality(Y: np.ndarray, rng: np.random.Generator) -> np.ndarra
 _WORKER_CFG: dict = {}
 
 def _worker_init(cfg: dict) -> None:
+    # Clamp BLAS/OpenMP to 1 thread per worker.
+    # Without this, each worker spawns cpu_count() BLAS threads on startup.
+    # On a 100-CPU machine with 8 workers: 8 × 100 = 800 threads compete for
+    # 100 CPUs → severe context switching → worse throughput than local 8-CPU.
+    # threadpoolctl works even after numpy is already imported (uses native API).
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(limits=1)
+    except ImportError:
+        import os
+        for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                   "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[_v] = "1"
     global _WORKER_CFG
     _WORKER_CFG = cfg
 
