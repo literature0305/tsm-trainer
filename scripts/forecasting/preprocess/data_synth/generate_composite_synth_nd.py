@@ -88,6 +88,71 @@ _LARGE_DS_ROWS: int = 500_000
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Filter cache helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+import hashlib as _hashlib
+import json as _json
+
+
+def _fcd_key(path: str) -> str:
+    """12-char stable hash of canonical path, used as cache filename prefix."""
+    return _hashlib.md5(str(Path(path).resolve()).encode()).hexdigest()[:12]
+
+
+def _check_full_cache(
+    filter_cache_dir: Path | None,
+    ds_path: str,
+    min_length: int,
+    ds_label: str,
+) -> tuple[np.ndarray | None, dict | None]:
+    """Load (valid_rows, meta_dict) from filter_cache_dir.
+
+    Returns (None, None) if either file is missing or corrupted.
+    When both files are found the dataset load can be skipped entirely.
+    """
+    if filter_cache_dir is None:
+        return None, None
+    key = _fcd_key(ds_path)
+    npy = filter_cache_dir / f"{key}_min{min_length}.npy"
+    meta_f = filter_cache_dir / f"{key}_meta.json"
+    if not npy.exists() or not meta_f.exists():
+        return None, None
+    try:
+        valid = np.load(npy)
+        with open(meta_f) as f:
+            meta = _json.load(f)
+        logger.info(
+            "  Pool CACHE%-52s  valid=%d (cache hit — load skipped)",
+            ds_label, len(valid),
+        )
+        return valid, meta
+    except Exception:
+        return None, None
+
+
+def _write_full_cache(
+    filter_cache_dir: Path | None,
+    ds_path: str,
+    min_length: int,
+    valid: np.ndarray,
+    target_keys: list[str],
+    n_variates: int,
+) -> None:
+    """Write valid_rows + metadata to filter_cache_dir.  Silently ignores errors."""
+    if filter_cache_dir is None:
+        return
+    try:
+        filter_cache_dir.mkdir(parents=True, exist_ok=True)
+        key = _fcd_key(ds_path)
+        np.save(filter_cache_dir / f"{key}_min{min_length}.npy", valid)
+        with open(filter_cache_dir / f"{key}_meta.json", "w") as f:
+            _json.dump({"target_keys": target_keys, "n_variates": n_variates}, f)
+    except Exception:
+        pass  # NFS write error → proceed without cache
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Variate Pool
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -142,71 +207,130 @@ def _detect_target_keys(ds) -> list[str]:
 
 
 class VariatePool:
-    """Random-access pool of 1-D time series drawn from multiple HF Arrow datasets."""
+    """Random-access pool of 1-D time series drawn from multiple HF Arrow datasets.
+
+    Scan phase (init):
+      For each path the filter cache (valid_rows + meta JSON) is checked first.
+      · Cache hit  → skip load_from_disk entirely (zero NFS mmap).
+      · Cache miss → load_from_disk → detect schema → filter → save cache → del.
+      Only ONE dataset is ever open (mmap'd) at a time, so VMA count stays
+      bounded at ≤ max_shards_per_dataset regardless of how many paths are given.
+
+    Cache phase (_prefetch_variate_cache):
+      Loads ONE dataset at a time, batch-reads variates, then immediately
+      releases (del ds, raw).  Same bounded-VMA guarantee.
+
+    Worker phase:
+      Workers inherit _SHARED_CACHE via Linux CoW fork.  _datasets is all-None
+      so no mmap regions are inherited.  get_variate() lazy-loads on demand
+      (fallback path only — never triggered when _VARIATE_CACHE is used).
+    """
 
     def __init__(
         self,
         data_paths: list[str],
         min_length: int,
         precomputed_meta: list[dict | None] | None = None,
+        filter_cache_dir: str | Path | None = None,
     ) -> None:
         import datasets as hf_datasets
 
-        self._datasets: list = []
+        self._datasets: list = []          # None until lazy-loaded in get_variate()
         self._n_variates: list[int] = []
-        self._valid_rows: list[np.ndarray] = []   # pre-filtered row indices per dataset
-        self._target_keys: list[list[str]] = []   # variate column names per dataset
+        self._valid_rows: list[np.ndarray] = []
+        self._target_keys: list[list[str]] = []
         self._cum: list[int] = [0]
         self._min_length = min_length
         self._loaded_paths: list[str] = []
 
+        _fcd = Path(filter_cache_dir) if filter_cache_dir else None
+
         for idx, path in enumerate(data_paths):
-            # If precomputed_meta is provided and this path failed in main, skip it
             meta_hint = (
                 precomputed_meta[idx]
                 if precomputed_meta is not None and idx < len(precomputed_meta)
                 else None
             )
             if meta_hint is None and precomputed_meta is not None:
-                continue
+                continue  # path was skipped in the parent process
 
+            ds_label = Path(path).name
+
+            # ── 1. Full cache check (no load_from_disk if both files found) ──────
+            if meta_hint is None:
+                valid_cached, meta_cached = _check_full_cache(
+                    _fcd, path, min_length, ds_label
+                )
+                if valid_cached is not None and meta_cached is not None:
+                    target_keys = meta_cached["target_keys"]
+                    n_var = meta_cached["n_variates"]
+                    valid = valid_cached
+                    if len(valid) > 0:
+                        pool_size = len(valid) * n_var
+                        self._loaded_paths.append(path)
+                        self._datasets.append(None)
+                        self._n_variates.append(n_var)
+                        self._valid_rows.append(valid)
+                        self._target_keys.append(target_keys)
+                        self._cum.append(self._cum[-1] + pool_size)
+                        logger.info(
+                            "  Pool +  %-55s  valid=%d  variates/row=%d  keys=%s",
+                            ds_label, len(valid), n_var, target_keys[:4],
+                        )
+                    continue
+
+            # ── 2. Cache miss (or worker precomputed_meta path): load dataset ─────
             try:
                 raw = hf_datasets.load_from_disk(str(path))
-                ds = raw.get("train", next(iter(raw.values()))) if hasattr(raw, "keys") else raw
+                ds = (
+                    raw["train"] if isinstance(raw, hf_datasets.DatasetDict) and "train" in raw
+                    else next(iter(raw.values())) if isinstance(raw, hf_datasets.DatasetDict)
+                    else raw
+                )
             except Exception as exc:
                 logger.warning("Cannot load %s: %s — skipping.", path, exc)
                 continue
 
             if meta_hint is not None:
-                # Workers: reuse precomputed metadata — skip NFS detect calls
                 target_keys = meta_hint["target_keys"]
                 n_var = meta_hint["n_variates"]
             else:
-                # Main process: detect normally
                 try:
                     target_keys = _detect_target_keys(ds)
                 except ValueError as exc:
-                    logger.warning("  Pool SKIP %-50s  (%s)", Path(path).name, exc)
+                    logger.warning("  Pool SKIP %-50s  (%s)", ds_label, exc)
+                    del ds, raw
                     continue
                 n_var = _detect_n_variates(ds, target_keys)
 
             valid = _build_length_filter(ds, min_length, n_var, target_keys, ds_path=path)
+
+            # ── 3. Save full cache before releasing dataset ────────────────────────
+            if meta_hint is None:
+                _write_full_cache(_fcd, path, min_length, valid, target_keys, n_var)
+
+            # ── 4. Release dataset IMMEDIATELY (prevents VMA accumulation) ─────────
+            n_rows = len(ds)
+            del ds, raw
+
             if len(valid) == 0:
                 logger.warning(
                     "  Pool SKIP %-50s  (no rows with length >= %d)",
-                    Path(path).name, min_length,
+                    ds_label, min_length,
                 )
                 continue
 
             pool_size = len(valid) * n_var
             self._loaded_paths.append(path)
-            self._datasets.append(ds)
+            self._datasets.append(None)  # lazy-loaded in get_variate() fallback
             self._n_variates.append(n_var)
             self._valid_rows.append(valid)
             self._target_keys.append(target_keys)
             self._cum.append(self._cum[-1] + pool_size)
-            logger.info("  Pool +  %-55s  valid=%d/%d  variates/row=%d  keys=%s",
-                        Path(path).name, len(valid), len(ds), n_var, target_keys[:4])
+            logger.info(
+                "  Pool +  %-55s  valid=%d/%d  variates/row=%d  keys=%s",
+                ds_label, len(valid), n_rows, n_var, target_keys[:4],
+            )
 
         if self.total == 0:
             raise RuntimeError("Variate pool is empty — check --data_paths.")
@@ -216,6 +340,12 @@ class VariatePool:
         return self._cum[-1]
 
     def get_variate(self, global_idx: int) -> np.ndarray | None:
+        """Return a single 1-D series.
+
+        Fast path: callers use _VARIATE_CACHE directly (_fetch_variate).
+        This is the fallback for the spawn-context worker path.  Datasets are
+        lazy-loaded on first access and kept open for the lifetime of this pool.
+        """
         global_idx = int(global_idx) % self.total
         ds_idx = next(
             (i for i in range(len(self._datasets))
@@ -230,14 +360,26 @@ class VariatePool:
         target_keys = self._target_keys[ds_idx]
         local_row_rank, var_idx = divmod(local, n_var)
         row_idx = int(valid_rows[local_row_rank % len(valid_rows)])
+
+        # Lazy-load dataset if not yet open
+        if self._datasets[ds_idx] is None:
+            try:
+                import datasets as hf_datasets
+                raw = hf_datasets.load_from_disk(self._loaded_paths[ds_idx])
+                self._datasets[ds_idx] = (
+                    raw["train"] if isinstance(raw, hf_datasets.DatasetDict) and "train" in raw
+                    else next(iter(raw.values())) if isinstance(raw, hf_datasets.DatasetDict)
+                    else raw
+                )
+            except Exception:
+                return None
+
         try:
             row = self._datasets[ds_idx][row_idx]
             if len(target_keys) == 1:
-                # Single-key mode: "target" column may be 1-D or 2-D (multivariate)
                 tgt = np.array(row[target_keys[0]], dtype=np.float64)
                 series = tgt if tgt.ndim == 1 else (tgt[var_idx] if tgt.ndim == 2 else None)
             else:
-                # Multi-key mode: each column is one variate
                 key = target_keys[var_idx % len(target_keys)]
                 series = np.array(row[key], dtype=np.float64)
                 if series.ndim != 1:
@@ -493,27 +635,24 @@ _SHARED_CACHE: list[np.ndarray] | None = None
 def _prefetch_variate_cache(
     pool: VariatePool, min_length: int, cache_size: int, seed: int = 42
 ) -> list[np.ndarray]:
-    """Bulk-load variates into RAM using Arrow batch read, shared via CoW fork.
+    """Bulk-load variates into RAM, opening ONE dataset at a time.
 
-    Called ONCE in the parent process before Pool() is created.  All worker
-    processes inherit the resulting list via Linux Copy-on-Write fork — the
-    data pages are never physically copied as long as workers only read (which
-    they do: _fetch_variate only calls list.__getitem__).
+    Each dataset is loaded via load_from_disk, batch-sampled with Arrow take()
+    (one contiguous NFS read per shard), then immediately released via
+    ``del ds, raw``.  At most ONE dataset's shards are mmap'd at any instant —
+    VMA count stays bounded at ≤ max_shards_per_dataset regardless of pool size.
 
-    Replaces the old per-worker pattern where N workers each spent 10–60 s
-    issuing batch reads against NFS, consuming N × cache_size × avg_len × 8
-    bytes of RAM independently.  With CoW sharing the cost is 1× regardless
-    of worker count.
-
-    Arrow batch read (ds[list_of_indices]) reads a contiguous file slice —
-    10–100× faster than the equivalent number of random seeks — so even the
-    one-time parent cost is low.
+    The resulting list is shared with all workers via Linux CoW fork (1× memory
+    cost, not N_workers×).  Previously each worker rebuilt this cache
+    independently.
     """
+    import datasets as hf_datasets
+
     rng = np.random.default_rng(seed)
     cache: list[np.ndarray] = []
 
-    for ds, n_var, valid_rows, target_keys, cum_lo, cum_hi in zip(
-        pool._datasets, pool._n_variates, pool._valid_rows, pool._target_keys,
+    for ds_path, n_var, valid_rows, target_keys, cum_lo, cum_hi in zip(
+        pool._loaded_paths, pool._n_variates, pool._valid_rows, pool._target_keys,
         pool._cum[:-1], pool._cum[1:],
     ):
         pool_size = cum_hi - cum_lo
@@ -523,11 +662,22 @@ def _prefetch_variate_cache(
         chosen_ranks = rng.choice(len(valid_rows), size=n_from_ds, replace=False)
         row_indices = [int(valid_rows[r]) for r in chosen_ranks]
 
+        # Load this dataset, sample, then release immediately
         try:
-            # Batch read: Arrow take() — far faster than n_from_ds individual reads
+            raw = hf_datasets.load_from_disk(ds_path)
+            ds = (
+                raw["train"] if isinstance(raw, hf_datasets.DatasetDict) and "train" in raw
+                else next(iter(raw.values())) if isinstance(raw, hf_datasets.DatasetDict)
+                else raw
+            )
+        except Exception as exc:
+            logger.warning("_prefetch: cannot load %s: %s", ds_path, exc)
+            continue
+
+        try:
+            # Batch read: Arrow take() — one contiguous NFS read per shard
             batch = ds[row_indices]
             if len(target_keys) == 1:
-                # Single-key mode: "target" may be 1-D or 2-D per row
                 for tgt in batch[target_keys[0]]:
                     arr = np.asarray(tgt, dtype=np.float64)
                     if arr.ndim == 1:
@@ -539,14 +689,16 @@ def _prefetch_variate_cache(
                             if len(row_arr) >= min_length and np.isfinite(row_arr).all():
                                 cache.append(row_arr)
             else:
-                # Multi-key wide format: each key is one variate column
                 for key in target_keys:
                     for tgt in batch[key]:
                         arr = np.asarray(tgt, dtype=np.float64)
                         if arr.ndim == 1 and len(arr) >= min_length and np.isfinite(arr).all():
                             cache.append(arr)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("_prefetch: sample error for %s: %s", ds_path, exc)
+        finally:
+            # Release immediately → closes all mmap regions for this dataset
+            del ds, raw
 
     return cache
 
@@ -580,7 +732,11 @@ def _worker_init(data_paths: list[str], cfg: dict) -> None:
     import time
     time.sleep((os.getpid() % 20) * 0.3)
     precomputed_meta = cfg.get("precomputed_meta")
-    _POOL = VariatePool(data_paths, cfg["min_length"], precomputed_meta=precomputed_meta)
+    _POOL = VariatePool(
+        data_paths, cfg["min_length"],
+        precomputed_meta=precomputed_meta,
+        filter_cache_dir=cfg.get("filter_cache_dir"),
+    )
     cache_size = cfg.get("variate_cache_size", 5000)
     if cache_size > 0:
         _VARIATE_CACHE = _prefetch_variate_cache(_POOL, cfg["min_length"], cache_size)
@@ -1109,6 +1265,12 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     n_workers = args.n_workers or cpu_count()
 
+    # Filter cache: stored in output_dir/.variate_filter_cache/
+    # Contains valid_rows.npy + meta.json per dataset path, keyed by path hash.
+    # On first run each dataset is loaded, filtered, and the cache is written.
+    # On subsequent runs the cache is hit before load_from_disk → 0 NFS mmap.
+    filter_cache_dir = str(output_dir / ".variate_filter_cache")
+
     cfg = {
         "min_length":          args.min_length,
         "max_length":          args.max_length,
@@ -1118,6 +1280,7 @@ def main() -> None:
         "neg_corr_ratio":      args.neg_corr_ratio,
         "base_seed":           args.seed,
         "variate_cache_size":  args.variate_cache_size,
+        "filter_cache_dir":    filter_cache_dir,
         # tmp_dirs added below after path setup (workers write npz directly)
     }
 
@@ -1143,7 +1306,11 @@ def main() -> None:
     global _SHARED_POOL, _SHARED_CACHE
 
     logger.info("Scanning input datasets (shared pool — built once in parent):")
-    _SHARED_POOL = VariatePool(args.data_paths, args.min_length)
+    logger.info("  Filter cache dir: %s", filter_cache_dir)
+    _SHARED_POOL = VariatePool(
+        args.data_paths, args.min_length,
+        filter_cache_dir=filter_cache_dir,
+    )
     logger.info("Total variate pool size: %d", _SHARED_POOL.total)
 
     # Build precomputed_meta for worker fallback path (fast path skips it).
@@ -1178,17 +1345,9 @@ def main() -> None:
     else:
         _SHARED_CACHE = None
 
-    # Release Arrow dataset objects → free all mmap regions and VMAs before fork.
-    # Workers use _SHARED_CACHE exclusively; keeping hundreds of datasets open
-    # multiplies the VMA count (each shard adds several VMAs) and causes Linux
-    # kernel memory operations to slow O(N_VMAs), stalling every forked worker.
-    n_ds_released = len(_SHARED_POOL._datasets)
-    _SHARED_POOL._datasets.clear()
-    logger.info(
-        "Released %d dataset mmap region(s) before fork (workers use shared cache).",
-        n_ds_released,
-    )
-
+    # _SHARED_POOL._datasets is all-None: datasets were released immediately after
+    # filtering in VariatePool.__init__ (del ds, raw).  No mmap regions are held
+    # open at this point, so no explicit clear is needed before fork.
     gc.collect()   # compact heap before fork to minimise CoW dirty pages
     tmp_dirs: dict[int, Path] = {}
     out_paths: dict[int, Path] = {}
